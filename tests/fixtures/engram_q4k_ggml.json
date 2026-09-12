@@ -1,0 +1,16 @@
+{
+  "cols": 256,
+  "dequantizer": "dequantize_row_q4_K",
+  "expected_bytes": 32768,
+  "expected_sha256": "87cca2ff3187776f6fe91ec1bf5eacb4ce5d8a36947555f16ff2d51309862335",
+  "format_version": 1,
+  "ggml_library_sha256": "3879866faa96895e12cf6ff9979e38e1334e70fea636d2b8c0efc5c18ad71081",
+  "ggml_source_commit": "dd4ffc004fa66262af40a17f18e3d743aaa37c00",
+  "layout": "packed_rows_then_little_endian_float32_rows",
+  "packed_bytes": 4608,
+  "packed_sha256": "574277556f3a46117c3d5464274dd69b9122319f84cc44f57580c6bfad115ef0",
+  "quantizer": "quantize_row_q4_K_ref",
+  "row_bytes": 144,
+  "rows": 32,
+  "seed": 54593
+}

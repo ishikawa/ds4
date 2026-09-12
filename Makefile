@@ -540,12 +540,23 @@ tests/test_ssd_cache: tests/test_ssd_cache.c ds4_ssd.c ds4_ssd.h
 test-ssd-cache: tests/test_ssd_cache
 	./tests/test_ssd_cache
 
-tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h
+tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h tests/fixtures/engram_q4k_ggml.bin
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram.c ds4_engram.c -lm
 
 .PHONY: test-engram
 test-engram: tests/test_engram
 	./tests/test_engram
+
+GGML_BUILD ?= ../llama.cpp/build/bin
+GGML_BASE_LIB ?= $(GGML_BUILD)/libggml-base.dylib
+
+tests/test_engram_ggml: tests/test_engram_ggml.c ds4_engram.c ds4_engram.h $(GGML_BASE_LIB)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram_ggml.c ds4_engram.c $(GGML_BASE_LIB) -Wl,-rpath,$(abspath $(GGML_BUILD)) -lm
+
+.PHONY: test-engram-ggml
+test-engram-ggml: tests/test_engram_ggml
+	@test -n "$(ENGRAM_Q4K_SIDECAR)" || { echo "set ENGRAM_Q4K_SIDECAR to a q4_k_row144 file"; exit 2; }
+	./tests/test_engram_ggml "$(ENGRAM_Q4K_SIDECAR)"
 
 tests/test_deepseek41_gguf.o: tests/test_deepseek41_gguf.c ds4.c ds4.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
@@ -851,7 +862,7 @@ clean:
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
-	rm -f tests/test_ssd_cache tests/test_engram
+	rm -f tests/test_ssd_cache tests/test_engram tests/test_engram_ggml
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma
 	rm -f tests/test_metal_tp_spec

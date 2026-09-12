@@ -326,11 +326,32 @@ static void test_q4_k_rows(void) {
     assert(unlink(path) == 0);
 }
 
+static void test_q4_k_ggml_fixture(void) {
+    enum { ROWS = 32 };
+    const char *path = "tests/fixtures/engram_q4k_ggml.bin";
+    const uint64_t expected_offset =
+        (uint64_t)ROWS * DS4_ENGRAM_Q4_K_ROW_BYTES;
+    float actual[ROWS][DS4_ENGRAM_DIM];
+    float expected[ROWS][DS4_ENGRAM_DIM];
+    uint32_t rows[ROWS];
+    for (uint32_t i = 0; i < ROWS; i++) rows[i] = i;
+
+    ds4_engram_table table;
+    assert(ds4_engram_table_open(&table, path, 0, ROWS,
+                                 DS4_ENGRAM_Q4_K_ROW_BYTES, false));
+    assert(ds4_engram_read(&table, rows, ROWS, actual[0]));
+    assert(pread(table.fd, expected, sizeof(expected), expected_offset) ==
+           (ssize_t)sizeof(expected));
+    assert(!memcmp(actual, expected, sizeof(actual)));
+    ds4_engram_table_close(&table);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
     test_q4_k_rows();
-    puts("Engram hashes, history and FP8/Q4_K disk rows: PASS");
+    test_q4_k_ggml_fixture();
+    puts("Engram hashes, history and FP8/Q4_K ggml rows: PASS");
     return 0;
 }
