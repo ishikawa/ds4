@@ -2582,15 +2582,34 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
-/* Engram is deliberately outside the weight mapping, not merely absent from
- * a residency list. Startup warming and any future weight-view code must not
- * turn its 189 GiB of random-access rows into a resident model allocation. */
+/* Embedded Engram is deliberately outside the weight mapping. Startup warming
+ * and future weight views must not make its random-access rows resident. */
+static bool model_engram_format(const ds4_model *m, uint32_t *row_bytes,
+                                bool *external) {
+    ds4_str encoding = {0}, storage = {0};
+    if (!model_get_string(m, "deepseek41.engram.encoding", &encoding)) return false;
+    if (ds4_streq(encoding, "e4m3_e8m0_32_row264"))
+        *row_bytes = DS4_ENGRAM_FP8_ROW_BYTES;
+    else if (ds4_streq(encoding, "q4_k_row144"))
+        *row_bytes = DS4_ENGRAM_Q4_K_ROW_BYTES;
+    else return false;
+    if (!model_get_string(m, "deepseek41.engram.storage", &storage)) {
+        *external = false;
+        return true;
+    }
+    if (ds4_streq(storage, "embedded")) *external = false;
+    else if (ds4_streq(storage, "external")) *external = true;
+    else return false;
+    return !*external || *row_bytes == DS4_ENGRAM_Q4_K_ROW_BYTES;
+}
+
 static void model_unmap_engram(ds4_model *m) {
-    ds4_str arch = {0}, encoding = {0};
+    ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "deepseek41")) return;
-    if (!model_get_string(m, "deepseek41.engram.encoding", &encoding) ||
-        !ds4_streq(encoding, "e4m3_e8m0_32_row264"))
+    uint32_t row_bytes = 0;
+    bool external = false;
+    if (!model_engram_format(m, &row_bytes, &external))
         ds4_die("unsupported V4.1 Engram row encoding");
     const ds4_tensor *tables[2] = {NULL, NULL};
     uint64_t resident_end = m->tensor_data_pos;
@@ -2600,8 +2619,8 @@ static void model_unmap_engram(ds4_model *m) {
         int index = ds4_streq(t->name, "blk.1.engram_embd.weight") ? 0 :
                     ds4_streq(t->name, "blk.14.engram_embd.weight") ? 1 : -1;
         if (index >= 0) {
-            if (tables[index] || t->ndim != 2 || t->type != 24 ||
-                t->dim[0] != 264 || !t->dim[1] || t->dim[1] > UINT32_MAX)
+            if (tables[index] || t->ndim != 2 || t->type != DS4_TENSOR_I8 ||
+                t->dim[0] != row_bytes || !t->dim[1] || t->dim[1] > UINT32_MAX)
                 ds4_die("invalid or duplicate V4.1 Engram tensor");
             tables[index] = t;
         } else {
@@ -2610,6 +2629,11 @@ static void model_unmap_engram(ds4_model *m) {
                 resident_end = t->abs_offset + t->bytes;
             if (t->bytes > m->max_tensor_bytes) m->max_tensor_bytes = t->bytes;
         }
+    }
+    if (external) {
+        if (tables[0] || tables[1])
+            ds4_die("external V4.1 Engram must not contain table tensors");
+        return;
     }
     if (!tables[0] || !tables[1]) ds4_die("V4.1 GGUF is missing Engram tables");
     const uint64_t start = tables[0]->abs_offset;
@@ -2957,10 +2981,25 @@ static void model_summary(const ds4_model *m) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
-        /* Each validated disk-only Engram row contains 256 weights and eight
-         * scale bytes. Scales count toward storage, not model parameters. */
-        if (v41 && m->tensors[i].abs_offset >= m->size)
-            params -= m->tensors[i].dim[1] * (DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
+        /* Raw Engram row storage represents 256 decoded model parameters. */
+        if (v41 && (ds4_streq(m->tensors[i].name, "blk.1.engram_embd.weight") ||
+                    ds4_streq(m->tensors[i].name, "blk.14.engram_embd.weight")))
+            params = params - m->tensors[i].elements +
+                     m->tensors[i].dim[1] * DS4_ENGRAM_DIM;
+    }
+    uint32_t engram_row_bytes = 0;
+    bool external_engram = false;
+    if (v41 && model_engram_format(m, &engram_row_bytes, &external_engram) &&
+        external_engram) {
+        ds4_array_ref arr;
+        if (model_get_array(m, "deepseek41.engram.rows", &arr) &&
+            arr.type == GGUF_VALUE_UINT32 && arr.len == DS4_ENGRAM_LAYERS) {
+            ds4_cursor rows_cursor = cursor_at(m, arr.data_pos);
+            for (uint32_t i = 0, rows = 0; i < DS4_ENGRAM_LAYERS; i++) {
+                if (!cursor_u32(&rows_cursor, &rows)) break;
+                params += (uint64_t)rows * DS4_ENGRAM_DIM;
+            }
+        }
     }
 
     printf("model: %.*s\n", (int)name.len, name.ptr);
@@ -6420,7 +6459,6 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
         {"deepseek41.scoring_func", "sqrtsoftplus"},
         {"deepseek41.hidden_act", "silu"},
         {"deepseek41.topk_method", "noaux_tc"},
-        {"deepseek41.engram.encoding", "e4m3_e8m0_32_row264"},
     };
     for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
         ds4_str got = {0};
@@ -6440,10 +6478,27 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
     config_expect_u32_array(m, "deepseek41.engram.rows", rows, 2);
     config_expect_u32_array(m, "deepseek41.compress_ratios", g_ds4_compress_ratios,
                             DS4_N_LAYER);
+    uint32_t row_bytes = 0;
+    bool external = false;
+    if (!model_engram_format(m, &row_bytes, &external))
+        ds4_die("unsupported V4.1 Engram storage or encoding");
+    if (external) {
+        ds4_array_ref paths, offsets;
+        if (!model_get_array(m, "deepseek41.engram.external_paths", &paths) ||
+            paths.type != GGUF_VALUE_STRING || paths.len != 2 ||
+            !model_get_array(m, "deepseek41.engram.external_offsets", &offsets) ||
+            offsets.type != GGUF_VALUE_UINT64 || offsets.len != 2)
+            ds4_die("external V4.1 Engram metadata is incomplete");
+    }
     for (uint32_t i = 0; i < 2; i++) {
-        ds4_tensor *t = required_tensorf(m, "blk.%u.engram_embd.weight", engram[i]);
-        tensor_expect_layout(t, DS4_TENSOR_I8, 2, 264, rows[i], 0);
-        if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
+        ds4_tensor *t = tensor_by_namef(m, "blk.%u.engram_embd.weight", engram[i]);
+        if (external) {
+            if (t) ds4_die("external V4.1 Engram must not contain table tensors");
+        } else {
+            if (!t) ds4_die("V4.1 GGUF is missing an Engram table");
+            tensor_expect_layout(t, DS4_TENSOR_I8, 2, row_bytes, rows[i], 0);
+            if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
+        }
     }
 }
 
@@ -39184,6 +39239,35 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
     return cursor_read(&c, out, bytes);
 }
 
+static bool ds41_read_string_array(const ds4_model *m, const char *key,
+                                   ds4_str out[DS4_ENGRAM_LAYERS]) {
+    ds4_array_ref arr;
+    if (!model_get_array(m, key, &arr) || arr.type != GGUF_VALUE_STRING ||
+        arr.len != DS4_ENGRAM_LAYERS) return false;
+    ds4_cursor c = cursor_at(m, arr.data_pos);
+    for (uint32_t i = 0; i < DS4_ENGRAM_LAYERS; i++)
+        if (!cursor_string(&c, &out[i]) || !out[i].len) return false;
+    return true;
+}
+
+static char *ds41_engram_path(const char *gguf_path, ds4_str path) {
+    if (memchr(path.ptr, '\0', path.len)) return NULL;
+    const char *slash = strrchr(gguf_path, '/');
+    const size_t directory = slash ? (size_t)(slash - gguf_path + 1) : 0;
+    const bool absolute = path.ptr[0] == '/';
+    if (path.len > SIZE_MAX - (absolute ? 1 : directory + 1)) return NULL;
+    char *result = malloc((absolute ? 0 : directory) + path.len + 1);
+    if (!result) return NULL;
+    size_t pos = 0;
+    if (!absolute && directory) {
+        memcpy(result, gguf_path, directory);
+        pos = directory;
+    }
+    memcpy(result + pos, path.ptr, path.len);
+    result[pos + path.len] = '\0';
+    return result;
+}
+
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
@@ -39306,14 +39390,34 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
         !ds41_read_array(m, "deepseek41.engram.multipliers", GGUF_VALUE_UINT64, 8,
                          g->engram.multipliers, sizeof(g->engram.multipliers)) ||
         !ds4_engram_layout_valid(&g->engram)) goto fail;
+    uint32_t row_bytes = 0;
+    bool external = false;
+    if (!model_engram_format(m, &row_bytes, &external)) goto fail;
+    ds4_str external_paths[DS4_ENGRAM_LAYERS];
+    uint64_t external_offsets[DS4_ENGRAM_LAYERS];
+    if (external &&
+        (!ds41_read_string_array(m, "deepseek41.engram.external_paths", external_paths) ||
+         !ds41_read_array(m, "deepseek41.engram.external_offsets", GGUF_VALUE_UINT64,
+                          DS4_ENGRAM_LAYERS, external_offsets,
+                          sizeof(external_offsets)))) goto fail;
     for (uint32_t i = 0; i < 2; i++) {
         const uint32_t il = i ? 14u : 1u;
-        const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
-        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i])) goto fail;
-        struct stat weights_stat, rows_stat;
-        if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
-            weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)
-            goto fail;
+        if (external) {
+            char *sidecar = ds41_engram_path(path, external_paths[i]);
+            if (!sidecar) ds4_die("invalid external V4.1 Engram path");
+            if (!ds4_engram_table_open(&g->table[i], sidecar, external_offsets[i],
+                                       g->engram.rows[i], row_bytes, true))
+                ds4_die_errno("cannot open external Engram table", sidecar);
+            free(sidecar);
+        } else {
+            const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
+            if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset,
+                                       g->engram.rows[i], row_bytes, false)) goto fail;
+            struct stat weights_stat, rows_stat;
+            if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
+                weights_stat.st_dev != rows_stat.st_dev ||
+                weights_stat.st_ino != rows_stat.st_ino) goto fail;
+        }
         const uint64_t bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * 4;
         g->engram_q_norm[i] = ds4_gpu_tensor_alloc(bytes);
         g->engram_k_norm[i] = ds4_gpu_tensor_alloc(bytes);

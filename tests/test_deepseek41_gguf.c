@@ -45,10 +45,12 @@ static void tensor(FILE *fp, const char *name, uint32_t type,
     put32(fp, type); put64(fp, offset);
 }
 
-static int run_fixture(int bad_layout) {
+static int run_fixture(int bad_layout, int q4) {
     enum { ALIGN = 16384 };
     const uint32_t rows = (1u << 24) + 3;
-    const uint64_t table_bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
+    const uint32_t row_bytes = q4 ? DS4_ENGRAM_Q4_K_ROW_BYTES :
+                                    DS4_ENGRAM_FP8_ROW_BYTES;
+    const uint64_t table_bytes = (uint64_t)rows * row_bytes;
     const uint64_t first = 2 * ALIGN + (bad_layout ? 32 : 0);
     const uint64_t second = align_up(first + table_bytes, ALIGN);
     const uint64_t file_size = second + table_bytes;
@@ -59,17 +61,29 @@ static int run_fixture(int bad_layout) {
     assert(fp);
     put32(fp, DS4_GGUF_MAGIC); put32(fp, 3); put64(fp, 3); put64(fp, 3);
     string_kv(fp, "general.architecture", "deepseek41");
-    string_kv(fp, "deepseek41.engram.encoding", "e4m3_e8m0_32_row264");
+    string_kv(fp, "deepseek41.engram.encoding",
+              q4 ? "q4_k_row144" : "e4m3_e8m0_32_row264");
     putstr(fp, "general.alignment"); put32(fp, GGUF_VALUE_UINT32); put32(fp, ALIGN);
     tensor(fp, "test.weight", DS4_TENSOR_F32, 16, 1, 0);
-    tensor(fp, "blk.1.engram_embd.weight", 24, 264, rows, first - ALIGN);
-    tensor(fp, "blk.14.engram_embd.weight", 24, 264, rows, second - ALIGN);
+    tensor(fp, "blk.1.engram_embd.weight", 24, row_bytes, rows, first - ALIGN);
+    tensor(fp, "blk.14.engram_embd.weight", 24, row_bytes, rows, second - ALIGN);
     assert(ftell(fp) < ALIGN);
     assert(fflush(fp) == 0 && ftruncate(fd, (off_t)file_size) == 0);
-    uint8_t row[DS4_ENGRAM_ROW_BYTES];
-    memset(row, 56, DS4_ENGRAM_DIM);
-    memset(row + DS4_ENGRAM_DIM, 127, DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
-    assert(pwrite(fd, row, sizeof(row), (off_t)(second + table_bytes - sizeof(row))) == sizeof(row));
+    uint8_t row[DS4_ENGRAM_MAX_ROW_BYTES];
+    if (q4) {
+        memset(row, 0, row_bytes);
+        const uint16_t one = 0x3c00u;
+        memcpy(row, &one, 2);
+        memset(row + 4, 1, 4);
+        memset(row + 12, 1, 4);
+        memset(row + 16, 0x11, 128);
+    } else {
+        memset(row, 56, DS4_ENGRAM_DIM);
+        memset(row + DS4_ENGRAM_DIM, 127,
+               DS4_ENGRAM_FP8_ROW_BYTES - DS4_ENGRAM_DIM);
+    }
+    assert(pwrite(fd, row, row_bytes,
+                  (off_t)(second + table_bytes - row_bytes)) == row_bytes);
     if (bad_layout) {
         pid_t pid = fork();
         assert(pid >= 0);
@@ -95,7 +109,8 @@ static int run_fixture(int bad_layout) {
         assert(*(const float *)tensor_data(&m, model_find_tensor(&m, "test.weight")) == 0);
         model_warm_weights(&m);
         ds4_engram_table table;
-        assert(ds4_engram_table_open(&table, path, t->abs_offset, rows));
+        assert(ds4_engram_table_open(&table, path, t->abs_offset, rows,
+                                     row_bytes, false));
         const uint32_t id = rows - 1;
         float values[DS4_ENGRAM_DIM];
         assert(ds4_engram_read(&table, &id, 1, values));
@@ -105,6 +120,28 @@ static int run_fixture(int bad_layout) {
     }
     assert(fclose(fp) == 0 && unlink(path) == 0);
     return 0;
+}
+
+static void run_external_fixture(void) {
+    enum { ALIGN = 16384 };
+    char path[] = "/tmp/ds41-external-gguf.XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    FILE *fp = fdopen(fd, "w+b");
+    assert(fp);
+    put32(fp, DS4_GGUF_MAGIC); put32(fp, 3); put64(fp, 1); put64(fp, 4);
+    string_kv(fp, "general.architecture", "deepseek41");
+    string_kv(fp, "deepseek41.engram.encoding", "q4_k_row144");
+    string_kv(fp, "deepseek41.engram.storage", "external");
+    putstr(fp, "general.alignment"); put32(fp, GGUF_VALUE_UINT32); put32(fp, ALIGN);
+    tensor(fp, "test.weight", DS4_TENSOR_F32, 16, 1, 0);
+    assert(fflush(fp) == 0 && ftruncate(fd, 2 * ALIGN) == 0);
+    ds4_model model;
+    model_open(&model, path, false, false);
+    assert(model.size == 2 * ALIGN && model.file_size == 2 * ALIGN);
+    assert(!model_find_tensor(&model, "blk.1.engram_embd.weight"));
+    model_close(&model);
+    assert(fclose(fp) == 0 && unlink(path) == 0);
 }
 
 static void check_model_layout(const char *path) {
@@ -140,8 +177,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     assert(argc == 1);
-    run_fixture(0);
-    run_fixture(1);
+    run_fixture(0, 0);
+    run_fixture(0, 1);
+    run_fixture(1, 0);
+    run_external_fixture();
     puts("V4.1 disk-only GGUF extent: PASS");
     return 0;
 }

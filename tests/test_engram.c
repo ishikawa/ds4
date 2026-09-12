@@ -109,7 +109,7 @@ static void test_rows(void) {
     assert(fd >= 0);
     /* Exercise offsets beyond 32 bits without allocating a large file. */
     const uint64_t offset = (1ull << 33) + 32;
-    uint8_t raw[3][DS4_ENGRAM_ROW_BYTES];
+    uint8_t raw[3][DS4_ENGRAM_FP8_ROW_BYTES];
     for (int r = 0; r < 3; r++) {
         for (int i = 0; i < 256; i++) raw[r][i] = i;
         raw[r][127] = 0;
@@ -118,7 +118,8 @@ static void test_rows(void) {
     }
     assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
     ds4_engram_table t;
-    assert(ds4_engram_table_open(&t, path, offset, 3));
+    assert(ds4_engram_table_open(&t, path, offset, 3,
+                                 DS4_ENGRAM_FP8_ROW_BYTES, false));
     assert(fcntl(t.fd, F_GETFD) & FD_CLOEXEC);
     uint32_t rows[] = {2, 0, 2, 1};
     float out[4 * 256];
@@ -188,9 +189,12 @@ static void test_rows(void) {
     free(batch);
     ds4_engram_table_close(&t);
     ds4_engram_table_close(&t);
-    assert(!ds4_engram_table_open(&t, path, offset, 1));
-    assert(!ds4_engram_table_open(&t, path, UINT64_MAX - 1, 3));
-    assert(!ds4_engram_table_open(&t, path, offset, 0));
+    assert(!ds4_engram_table_open(&t, path, offset, 1,
+                                  DS4_ENGRAM_FP8_ROW_BYTES, false));
+    assert(!ds4_engram_table_open(&t, path, UINT64_MAX - 1, 3,
+                                  DS4_ENGRAM_FP8_ROW_BYTES, false));
+    assert(!ds4_engram_table_open(&t, path, offset, 0,
+                                  DS4_ENGRAM_FP8_ROW_BYTES, false));
     close(fd);
     assert(unlink(path) == 0);
 }
@@ -200,14 +204,16 @@ static void test_all_scaled_values(void) {
     const int fd = mkstemp(path);
     assert(fd >= 0);
     assert(unlink(path) == 0);
-    ds4_engram_table table = {.fd = fd, .rows = 1};
+    ds4_engram_table table = {.fd = fd, .rows = 1,
+                              .row_bytes = DS4_ENGRAM_FP8_ROW_BYTES};
     const uint32_t row = 0;
-    uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+    uint8_t raw[DS4_ENGRAM_FP8_ROW_BYTES];
     float out[DS4_ENGRAM_DIM];
     for (uint32_t code = 0; code < 256; code++) {
         memset(raw, code, DS4_ENGRAM_DIM);
         for (uint32_t scale = 0; scale < 256; scale++) {
-            memset(raw + DS4_ENGRAM_DIM, scale, DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
+            memset(raw + DS4_ENGRAM_DIM, scale,
+                   DS4_ENGRAM_FP8_ROW_BYTES - DS4_ENGRAM_DIM);
             assert(pwrite(fd, raw, sizeof(raw), 0) == sizeof(raw));
             const int exponent = (code >> 3) & 15;
             double value = exponent ? (1.0 + (code & 7u) / 8.0) * pow(2.0, exponent - 7) :
@@ -230,10 +236,101 @@ static void test_all_scaled_values(void) {
     close(fd);
 }
 
+static float reference_f16(uint16_t h) {
+    const int sign = h & 0x8000u ? -1 : 1;
+    const int exponent = (h >> 10) & 31;
+    const int mantissa = h & 1023;
+    if (!exponent) return sign * ldexpf((float)mantissa, -24);
+    if (exponent == 31) return mantissa ? NAN : sign * INFINITY;
+    return sign * ldexpf((float)(1024 + mantissa), exponent - 25);
+}
+
+static void reference_q4_k(const uint8_t raw[DS4_ENGRAM_Q4_K_ROW_BYTES],
+                           float out[DS4_ENGRAM_DIM]) {
+    uint16_t dh, mh;
+    memcpy(&dh, raw, 2);
+    memcpy(&mh, raw + 2, 2);
+    const float d = reference_f16(dh), dmin = reference_f16(mh);
+    for (int group = 0; group < 8; group++) {
+        uint8_t scale, min;
+        if (group < 4) {
+            scale = raw[4 + group] & 63u;
+            min = raw[8 + group] & 63u;
+        } else {
+            scale = (raw[8 + group] & 15u) | ((raw[group] >> 6) << 4);
+            min = (raw[8 + group] >> 4) | ((raw[4 + group] >> 6) << 4);
+        }
+        const uint8_t *q = raw + 16 + (group / 2) * 32;
+        for (int i = 0; i < 32; i++) {
+            const uint8_t code = group & 1 ? q[i] >> 4 : q[i] & 15u;
+            out[group * 32 + i] = d * scale * code - dmin * min;
+        }
+    }
+}
+
+static void test_q4_k_rows(void) {
+    char path[] = "/tmp/ds4-engram-q4k-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    const uint64_t offset = 37;
+    uint8_t raw[2][DS4_ENGRAM_Q4_K_ROW_BYTES];
+    for (int row = 0; row < 2; row++) {
+        memset(raw[row], 0, sizeof(raw[row]));
+        const uint16_t d = row ? 0x3800u : 0x3c00u;
+        const uint16_t dmin = row ? 0x3400u : 0x3a00u;
+        memcpy(raw[row], &d, 2);
+        memcpy(raw[row] + 2, &dmin, 2);
+        for (int i = 0; i < 12; i++) raw[row][4 + i] = (uint8_t)(17 * i + 13 * row);
+        for (int i = 0; i < 128; i++) raw[row][16 + i] = (uint8_t)(29 * i + 7 * row);
+    }
+    assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
+    assert(ftruncate(fd, offset + sizeof(raw) + 19) == 0);
+
+    ds4_engram_table table;
+    assert(ds4_engram_table_open(&table, path, offset, 2,
+                                 DS4_ENGRAM_Q4_K_ROW_BYTES, false));
+    const uint32_t ids[] = {1, 0};
+    float actual[2][DS4_ENGRAM_DIM], expected[2][DS4_ENGRAM_DIM];
+    reference_q4_k(raw[1], expected[0]);
+    reference_q4_k(raw[0], expected[1]);
+    assert(ds4_engram_read(&table, ids, 2, actual[0]));
+    assert(!memcmp(actual, expected, sizeof(actual)));
+    uint32_t batch_ids[DS4_ENGRAM_COLS];
+    float batch[DS4_ENGRAM_COLS][DS4_ENGRAM_DIM];
+    for (int i = 0; i < DS4_ENGRAM_COLS; i++) batch_ids[i] = i & 1;
+    assert(ds4_engram_read_batch(&table, batch_ids, 1, DS4_ENGRAM_COLS, batch[0]));
+    for (int i = 0; i < DS4_ENGRAM_COLS; i++)
+        assert(!memcmp(batch[i], expected[batch_ids[i] ? 0 : 1], sizeof(batch[i])));
+    ds4_engram_table_close(&table);
+
+    assert(ftruncate(fd, offset + sizeof(raw)) == 0);
+    assert(ds4_engram_table_open(&table, path, offset, 2,
+                                 DS4_ENGRAM_Q4_K_ROW_BYTES, true));
+    assert(ds4_engram_read(&table, ids, 2, actual[0]));
+    ds4_engram_table_close(&table);
+    assert(ftruncate(fd, offset + sizeof(raw) - 1) == 0);
+    assert(!ds4_engram_table_open(&table, path, offset, 2,
+                                  DS4_ENGRAM_Q4_K_ROW_BYTES, true));
+    assert(ftruncate(fd, offset + sizeof(raw) + 1) == 0);
+    assert(!ds4_engram_table_open(&table, path, offset, 2,
+                                  DS4_ENGRAM_Q4_K_ROW_BYTES, true));
+    assert(ftruncate(fd, offset + sizeof(raw)) == 0);
+    const uint16_t infinity = 0x7c00u;
+    assert(pwrite(fd, &infinity, 2, offset) == 2);
+    assert(ds4_engram_table_open(&table, path, offset, 2,
+                                 DS4_ENGRAM_Q4_K_ROW_BYTES, true));
+    const uint32_t first = 0;
+    assert(!ds4_engram_read(&table, &first, 1, actual[0]) && errno == EDOM);
+    ds4_engram_table_close(&table);
+    close(fd);
+    assert(unlink(path) == 0);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
-    puts("Engram hashes, history and bounded disk rows: PASS");
+    test_q4_k_rows();
+    puts("Engram hashes, history and FP8/Q4_K disk rows: PASS");
     return 0;
 }

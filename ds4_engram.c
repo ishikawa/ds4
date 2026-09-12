@@ -85,11 +85,15 @@ bool ds4_engram_hash(const ds4_engram_layout *l, ds4_engram_history *h,
 }
 
 bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
-                           uint64_t offset, uint32_t rows) {
+                           uint64_t offset, uint32_t rows, uint32_t row_bytes,
+                           bool exact_size) {
     if (!t) return false;
     *t = (ds4_engram_table){.fd = -1};
-    uint64_t bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
-    if (!path || !rows || offset > INT64_MAX || bytes > INT64_MAX - offset) {
+    uint64_t bytes = (uint64_t)rows * row_bytes;
+    if (!path || !rows ||
+        (row_bytes != DS4_ENGRAM_FP8_ROW_BYTES &&
+         row_bytes != DS4_ENGRAM_Q4_K_ROW_BYTES) ||
+        offset > INT64_MAX || bytes > INT64_MAX - offset) {
         errno = EINVAL;
         return false;
     }
@@ -97,14 +101,17 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
     if (fd < 0) return false;
     struct stat st;
     if (fstat(fd, &st) != 0) goto fail;
-    if (!S_ISREG(st.st_mode) || st.st_size < 0 || offset + bytes > (uint64_t)st.st_size) {
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 ||
+        offset + bytes > (uint64_t)st.st_size ||
+        (exact_size && offset + bytes != (uint64_t)st.st_size)) {
         errno = EINVAL;
         goto fail;
     }
 #ifdef __APPLE__
     if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
 #endif
-    *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows};
+    *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows,
+                            .row_bytes = row_bytes};
     return true;
 fail: {
         int saved = errno;
@@ -120,10 +127,10 @@ void ds4_engram_table_close(ds4_engram_table *t) {
     *t = (ds4_engram_table){.fd = -1};
 }
 
-static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES]) {
+static bool read_row(int fd, uint64_t offset, uint8_t *row, size_t row_bytes) {
     size_t done = 0;
-    while (done < DS4_ENGRAM_ROW_BYTES) {
-        ssize_t n = pread(fd, row + done, DS4_ENGRAM_ROW_BYTES - done,
+    while (done < row_bytes) {
+        ssize_t n = pread(fd, row + done, row_bytes - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
@@ -142,6 +149,64 @@ static float e4m3(uint8_t byte) {
     return byte & 128 ? -value : value;
 }
 
+static float f16(uint16_t half) {
+    const uint32_t sign = (uint32_t)(half & 0x8000u) << 16;
+    uint32_t exponent = (half >> 10) & 31u, mantissa = half & 1023u, bits;
+    if (!exponent) {
+        if (!mantissa) bits = sign;
+        else {
+            exponent = 113;
+            while (!(mantissa & 1024u)) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            bits = sign | (exponent << 23) | ((mantissa & 1023u) << 13);
+        }
+    } else if (exponent == 31) {
+        bits = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        bits = sign | ((exponent + 112u) << 23) | (mantissa << 13);
+    }
+    float value;
+    memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void q4_k_scale_min(int index, const uint8_t *packed,
+                           uint8_t *scale, uint8_t *min) {
+    if (index < 4) {
+        *scale = packed[index] & 63u;
+        *min = packed[index + 4] & 63u;
+    } else {
+        *scale = (packed[index + 4] & 15u) | ((packed[index - 4] >> 6) << 4);
+        *min = (packed[index + 4] >> 4) | ((packed[index] >> 6) << 4);
+    }
+}
+
+static bool dequantize_q4_k(const uint8_t raw[DS4_ENGRAM_Q4_K_ROW_BYTES],
+                            float out[DS4_ENGRAM_DIM]) {
+    uint16_t dh, mh;
+    memcpy(&dh, raw, sizeof(dh));
+    memcpy(&mh, raw + 2, sizeof(mh));
+    const float d = f16(dh), dmin = f16(mh);
+    if (!isfinite(d) || !isfinite(dmin)) {
+        errno = EDOM;
+        return false;
+    }
+    const uint8_t *scales = raw + 4, *q = raw + 16;
+    for (int group = 0; group < 4; group++) {
+        uint8_t sc, min;
+        q4_k_scale_min(2 * group, scales, &sc, &min);
+        const float d1 = d * sc, m1 = dmin * min;
+        q4_k_scale_min(2 * group + 1, scales, &sc, &min);
+        const float d2 = d * sc, m2 = dmin * min;
+        for (int i = 0; i < 32; i++) out[group * 64 + i] = d1 * (q[i] & 15u) - m1;
+        for (int i = 0; i < 32; i++) out[group * 64 + 32 + i] = d2 * (q[i] >> 4) - m2;
+        q += 32;
+    }
+    return true;
+}
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
@@ -155,9 +220,18 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
             return false;
         }
     }
-    uint8_t raw[DS4_ENGRAM_ROW_BYTES];
+    uint8_t raw[DS4_ENGRAM_MAX_ROW_BYTES];
     for (size_t i = 0; i < count; i++) {
-        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
+        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * t->row_bytes,
+                      raw, t->row_bytes)) return false;
+        if (t->row_bytes == DS4_ENGRAM_Q4_K_ROW_BYTES) {
+            if (!dequantize_q4_k(raw, out + i * DS4_ENGRAM_DIM)) return false;
+            continue;
+        }
+        if (t->row_bytes != DS4_ENGRAM_FP8_ROW_BYTES) {
+            errno = EINVAL;
+            return false;
+        }
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
             uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
             if ((code & 127) == 127 || scale == 255) {
