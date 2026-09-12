@@ -85,7 +85,9 @@ def engram_layout(config, tokenizer):
                 primes=primes, multipliers=multipliers)
 
 
-def metadata(hf_dir, revision):
+def metadata(hf_dir, revision, engram_encoding="e4m3_e8m0_32_row264",
+             engram_storage="embedded", external_paths=None,
+             external_offsets=None):
     from tokenizers import Tokenizer
 
     with open(os.path.join(hf_dir, "config.json"), "rb") as fp:
@@ -113,7 +115,8 @@ def metadata(hf_dir, revision):
         kv_string("general.source.revision", revision),
         kv_u32("general.alignment", GGUF_ALIGNMENT),
         kv_string("deepseek41.config", json.dumps(config, sort_keys=True, separators=(",", ":"))),
-        kv_string("deepseek41.engram.encoding", "e4m3_e8m0_32_row264"),
+        kv_string("deepseek41.engram.encoding", engram_encoding),
+        kv_string("deepseek41.engram.storage", engram_storage),
         kv_u32_array("deepseek41.engram.layer_ids", layout["layers"]),
         kv_u32_array("deepseek41.engram.rows", layout["rows"]),
         kv_u32("deepseek41.engram.compressed_vocab_size", layout["compressed_vocab_size"]),
@@ -131,6 +134,16 @@ def metadata(hf_dir, revision):
         kv_bool("tokenizer.ggml.add_bos_token", True),
         kv_bool("tokenizer.ggml.add_eos_token", False),
     ]
+    if engram_storage == "external":
+        if (not external_paths or len(external_paths) != len(layout["layers"]) or
+                external_offsets is None or len(external_offsets) != len(layout["layers"])):
+            raise ValueError("external Engram needs one path and offset per layer")
+        records.extend([
+            array_record("deepseek41.engram.external_paths", GGUF_STRING, external_paths),
+            array_record("deepseek41.engram.external_offsets", GGUF_UINT64, external_offsets),
+        ])
+    elif engram_storage != "embedded":
+        raise ValueError(f"unknown Engram storage: {engram_storage}")
     for key in (
         "vocab_size", "hidden_size", "moe_intermediate_size", "num_hidden_layers",
         "num_attention_heads", "num_key_value_heads", "head_dim", "qk_rope_head_dim",

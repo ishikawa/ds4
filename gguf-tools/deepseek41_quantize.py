@@ -2,8 +2,8 @@
 """Convert DeepSeek V4.1 Flash to DwarfStar's Q2 or Q4_K GGUF.
 
 Uses the project's C quantizers. Engram FP8 rows and their scales are packed
-losslessly at the end of the file, outside the main model's resident extent.
-Vision and DSpark are separate models and are not part of this text GGUF.
+losslessly by default; pre-quantized Q4_K rows can instead be embedded or
+referenced as external sidecars. Vision and DSpark are separate models.
 """
 
 import argparse
@@ -31,6 +31,70 @@ QUANTIZATION = {
     "q4": "Q4_K gate/up/down; Q8_0 attention/shared/head",
 }
 
+ENGRAM_Q4K_ROW_BYTES = 144
+
+
+@dataclasses.dataclass(frozen=True)
+class EngramQ4K:
+    layer: int
+    path: str
+    rows: int
+    offset: int = 0
+
+
+def load_engram_q4k(config, files=None, directory=None):
+    layers = config["text_config"]["engram_layer_ids"]
+    expected_rows = config["text_config"].get("engram_num_embeddings")
+    if expected_rows is None:
+        expected_rows = [384006168, 384016682]
+    if len(layers) != 2 or len(expected_rows) != len(layers):
+        raise ValueError("expected two Engram layers and row counts")
+    if bool(files) == bool(directory):
+        raise ValueError("specify either --engram-q4k or --engram-q4k-dir")
+    selected = {}
+    if directory:
+        for layer in layers:
+            selected[layer] = os.path.join(directory, f"engram-{layer}.q4_k.bin")
+    else:
+        positional = []
+        for spec in files:
+            if "=" in spec:
+                layer_text, path = spec.split("=", 1)
+                try:
+                    layer = int(layer_text)
+                except ValueError as error:
+                    raise ValueError(f"invalid Engram layer in {spec}") from error
+                if layer in selected:
+                    raise ValueError(f"duplicate Engram sidecar for layer {layer}")
+                selected[layer] = path
+            else:
+                positional.append(spec)
+        remaining = [layer for layer in layers if layer not in selected]
+        if len(positional) != len(remaining):
+            raise ValueError("--engram-q4k needs one file per Engram layer")
+        selected.update(zip(remaining, positional))
+    if set(selected) != set(layers):
+        raise ValueError(f"Engram sidecars must cover layers {layers}")
+    result = []
+    for layer, rows in zip(layers, expected_rows):
+        path = os.path.abspath(selected[layer])
+        with open(path + ".json", "rb") as fp:
+            info = json.load(fp)
+        required = {"rows": rows, "bytes_per_row": ENGRAM_Q4K_ROW_BYTES,
+                    "cols": 256, "block_type": "Q4_K", "ggml_type": QTYPE_Q4_K,
+                    "format_version": 1, "complete": True}
+        for key, expected in required.items():
+            if info.get(key) != expected:
+                raise ValueError(f"{path}.json: expected {key}={expected!r}")
+        offset = info.get("offset", 0)
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"{path}.json: invalid offset")
+        expected_size = offset + rows * ENGRAM_Q4K_ROW_BYTES
+        if os.path.getsize(path) != expected_size:
+            raise ValueError(f"{path}: expected {expected_size} bytes")
+        result.append(EngramQ4K(layer, path, rows, offset))
+    return result
+
 
 def scale_name(name):
     return name.removesuffix(".weight") + ".scale"
@@ -56,7 +120,7 @@ def validate_scales(tensors):
             raise ValueError(f"{name}: expected E8M0 scales {expected}")
 
 
-def build_plan(db, config, quant="q2"):
+def build_plan(db, config, quant="q2", engram_q4k=None, engram_external=False):
     if quant not in QUANTIZATION:
         raise ValueError(f"unknown quantization recipe: {quant}")
     c = config["text_config"]
@@ -139,14 +203,26 @@ def build_plan(db, config, quant="q2"):
             index = c["engram_layer_ids"].index(layer)
             rows = c["engram_num_embeddings"][index]
             engram = f"{src}.engram"
-            claim(f"{engram}.embed.weight", (rows, 256), "F8_E4M3")
-            claim(f"{engram}.embed.scale", (rows, 8), "F8_E8M0")
-            disk.append(TensorPlan(f"{dst}.engram_embd.weight", (264, rows), QTYPE_I8,
-                                   "engram_disk", source=f"{engram}.embed.weight", raw_copy=True))
+            if engram_q4k:
+                sidecar = engram_q4k[index]
+                if sidecar.layer != layer or sidecar.rows != rows:
+                    raise ValueError(f"layer {layer}: Engram sidecar row mismatch")
+                if not engram_external:
+                    disk.append(TensorPlan(f"{dst}.engram_embd.weight",
+                                           (ENGRAM_Q4K_ROW_BYTES, rows), QTYPE_I8,
+                                           "engram_q4k", source=sidecar.path,
+                                           row_start=sidecar.offset, raw_copy=True))
+            else:
+                claim(f"{engram}.embed.weight", (rows, 256), "F8_E4M3")
+                claim(f"{engram}.embed.scale", (rows, 8), "F8_E8M0")
+                disk.append(TensorPlan(f"{dst}.engram_embd.weight", (264, rows), QTYPE_I8,
+                                       "engram_disk", source=f"{engram}.embed.weight", raw_copy=True))
             for part in ("q", "k"):
                 regular(f"{dst}.engram_{part}_norm.weight", f"{engram}.{part}_weight", (hc, dim), QTYPE_F32, "engram")
             regular(f"{dst}.engram_kv.weight", f"{engram}.wkv.weight", ((hc + 1) * dim, 24 * 256), QTYPE_F16, "engram")
     omitted = {name for name in db.tensors if name.startswith(("mtp.", "vision.", "aligner.", "image_"))}
+    if engram_q4k:
+        omitted.update(name for name in db.tensors if ".engram.embed." in name)
     if consumed | omitted != set(db.tensors):
         raise ValueError(f"unclaimed source tensors: {sorted(set(db.tensors) - consumed - omitted)[:10]}")
     offset = 0
@@ -215,6 +291,18 @@ def write_engram(fp, item, db, np):
         fp.write(packed.tobytes())
 
 
+def write_engram_q4k(fp, item):
+    remaining = item.nbytes
+    with open(item.source, "rb") as source:
+        source.seek(item.row_start)
+        while remaining:
+            chunk = source.read(min(4 << 20, remaining))
+            if not chunk:
+                raise ValueError(f"{item.name}: truncated Q4_K sidecar")
+            fp.write(chunk)
+            remaining -= len(chunk)
+
+
 def write_gguf(args, plan, records, db):
     quantizer = NativeQuantizer(args.quants_library)
     imatrix = Imatrix(args.imatrix, quantizer.np)
@@ -266,6 +354,8 @@ def write_gguf(args, plan, records, db):
                 raise ValueError(f"incorrect offset for {item.name}")
             if item.role == "engram_disk":
                 write_engram(fp, item, db, quantizer.np)
+            elif item.role == "engram_q4k":
+                write_engram_q4k(fp, item)
             elif item.is_expert:
                 def convert(expert):
                     values = quantizer.to_f32(db, item.source.format(expert=expert))
@@ -303,6 +393,13 @@ def main():
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--engram-q4k", action="append", metavar="[LAYER=]FILE",
+                        help="Q4_K sidecar; repeat once per Engram layer")
+    source.add_argument("--engram-q4k-dir", metavar="DIR",
+                        help="directory containing engram-{layer}.q4_k.bin")
+    parser.add_argument("--engram-q4k-external", action="store_true",
+                        help="reference Q4_K sidecars instead of embedding them")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=os.path.join(os.path.dirname(__file__), f"libds4quants.{suffix}"))
     args = parser.parse_args()
@@ -310,10 +407,26 @@ def main():
         parser.error("source revision must be a full commit hash")
     if not 1 <= args.threads <= 32:
         parser.error("threads must be between 1 and 32")
-    config, records = metadata(args.hf, args.source_revision)
-    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales)
+    with open(os.path.join(args.hf, "config.json"), "rb") as fp:
+        source_config = json.load(fp)
+    sidecars = None
+    if args.engram_q4k or args.engram_q4k_dir:
+        sidecars = load_engram_q4k(source_config, args.engram_q4k,
+                                   args.engram_q4k_dir)
+    elif args.engram_q4k_external:
+        parser.error("--engram-q4k-external requires Q4_K sidecars")
+    storage = "external" if args.engram_q4k_external else "embedded"
+    config, records = metadata(
+        args.hf, args.source_revision,
+        "q4_k_row144" if sidecars else "e4m3_e8m0_32_row264", storage,
+        [item.path for item in sidecars] if args.engram_q4k_external else None,
+        [item.offset for item in sidecars] if args.engram_q4k_external else None)
+    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales,
+                  skip_tensors=(lambda name: ".engram.embed." in name)
+                  if sidecars else None)
     try:
-        plan = build_plan(db, config, args.quant)
+        plan = build_plan(db, config, args.quant, sidecars,
+                          args.engram_q4k_external)
         records.append(kv_string("deepseek41.quantization", QUANTIZATION[args.quant]))
         records.append(kv_string("deepseek41.calibration", "imatrix" if args.imatrix else "weight-energy bootstrap"))
         if args.imatrix:

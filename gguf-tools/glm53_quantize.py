@@ -294,11 +294,14 @@ class SourceDB:
         hf_dir,
         index_validator=validate_glm53_index,
         scale_validator=validate_fp8_scales,
+        skip_tensors=None,
     ):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
-        document, self.weight_map = load_index(index_path)
-        index_validator(self.weight_map)
+        document, weight_map = load_index(index_path)
+        index_validator(weight_map)
+        self.weight_map = {name: shard for name, shard in weight_map.items()
+                           if not skip_tensors or not skip_tensors(name)}
         self.declared_bytes = document.get("metadata", {}).get("total_size")
         self.tensors = {}
         self._fds = {}
@@ -309,6 +312,8 @@ class SourceDB:
             if not os.path.isfile(path):
                 fail(f"missing source shard {path}")
             for name, info in load_safetensors_header(path).items():
+                if skip_tensors and skip_tensors(name):
+                    continue
                 if self.weight_map.get(name) != shard:
                     fail(f"index assigns {name} to {self.weight_map.get(name)!r}, not {shard}")
                 if name in self.tensors:

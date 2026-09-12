@@ -19,12 +19,16 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gguf-tools"))
 from deepseek41_quantize import (NativeQuantizer, validate_scales, write_engram,
-                                write_gguf, scale_name, QUANTIZATION, build_plan)
-from deepseek41_metadata import GGUF_ALIGNMENT, engram_layout, metadata
+                                write_gguf, scale_name, QUANTIZATION, build_plan,
+                                load_engram_q4k, write_engram_q4k)
+from deepseek41_metadata import (GGUF_ALIGNMENT, engram_layout, metadata,
+                                 array_record)
 import deepseek41_validate_gguf as artifact_audit
+import glm53_quantize as quantize_common
 from glm53_quantize import (
     TensorPlan, QTYPE_F32, QTYPE_I8, QTYPE_IQ2_XXS, QTYPE_Q2_K, QTYPE_Q4_K,
     align, kv_string, kv_u32, load_tokenizer_records, print_plan, qtype_nbytes,
+    GGUF_STRING, GGUF_UINT64,
 )
 
 
@@ -74,6 +78,29 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonfinite"):
             self.q.to_f32(db, db.name)
 
+    def test_source_db_can_skip_engram_shards(self):
+        weight_map = {
+            "layers.1.engram.embed.weight": "missing.safetensors",
+            "layers.14.engram.embed.scale": "kept.safetensors",
+            "kept.weight": "kept.safetensors",
+        }
+        header = {
+            "layers.14.engram.embed.scale": {"shape": [1, 8], "dtype": "F8_E8M0",
+                                               "offset": 0, "nbytes": 8},
+            "kept.weight": {"shape": [2], "dtype": "F32", "offset": 8, "nbytes": 8},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "kept.safetensors").write_bytes(bytes(16))
+            with mock.patch.object(quantize_common, "load_index",
+                                   return_value=({}, weight_map)), \
+                 mock.patch.object(quantize_common, "load_safetensors_header",
+                                   return_value=header):
+                db = quantize_common.SourceDB(
+                    tmp, index_validator=lambda _: None, scale_validator=lambda _: None,
+                    skip_tensors=lambda name: ".engram.embed." in name)
+            self.assertEqual(set(db.tensors), {"kept.weight"})
+            db.close()
+
     def test_fp4_order_and_quants(self):
         codes = np.arange(256, dtype=np.uint8).reshape(2, 128)
         scales = np.arange(120, 136, dtype=np.uint8).reshape(2, 8)
@@ -116,6 +143,89 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "nonfinite Engram"):
             write_engram(io.BytesIO(), item, db, np)
 
+    def test_q4k_sidecars(self):
+        config = {"text_config": {"engram_layer_ids": [1, 14],
+                                   "engram_num_embeddings": [3, 4]}}
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for layer, rows in zip((1, 14), (3, 4)):
+                path = Path(tmp) / f"engram-{layer}.q4_k.bin"
+                path.write_bytes(bytes((i + layer) & 255 for i in range(rows * 144)))
+                Path(str(path) + ".json").write_text(json.dumps({
+                    "rows": rows, "bytes_per_row": 144, "cols": 256,
+                    "block_type": "Q4_K", "ggml_type": QTYPE_Q4_K,
+                    "format_version": 1, "complete": True,
+                }))
+                paths.append(path)
+            direct = load_engram_q4k(config, [f"1={paths[0]}", f"14={paths[1]}"], None)
+            by_dir = load_engram_q4k(config, None, tmp)
+            self.assertEqual(direct, by_dir)
+            item = TensorPlan("blk.1.engram_embd.weight", (144, 3), QTYPE_I8,
+                              "engram_q4k", source=str(paths[0]))
+            item.nbytes = 3 * 144
+            output = io.BytesIO()
+            write_engram_q4k(output, item)
+            self.assertEqual(output.getvalue(), paths[0].read_bytes())
+
+            class EmptyDB:
+                tensors = {}
+                def info(self, name):
+                    raise KeyError(name)
+                def close(self):
+                    pass
+            common = [kv_string("general.architecture", "deepseek41"),
+                      kv_u32("general.alignment", GGUF_ALIGNMENT),
+                      kv_string("general.source.revision", "0" * 40),
+                      kv_string("deepseek41.quantization", QUANTIZATION["q2"]),
+                      kv_string("deepseek41.calibration", "weight-energy bootstrap"),
+                      kv_string("deepseek41.engram.encoding", "q4_k_row144")]
+            args = types.SimpleNamespace(imatrix=None, quants_library=self.q.lib._name,
+                                         threads=1, resume=False)
+            item.offset = 0
+            embedded_records = common + [kv_string("deepseek41.engram.storage", "embedded")]
+            args.out = str(Path(tmp) / "embedded.gguf")
+            with contextlib.redirect_stdout(io.StringIO()):
+                write_gguf(args, [item], embedded_records, EmptyDB())
+            data_start, _ = print_plan([item], embedded_records, [], GGUF_ALIGNMENT)
+            self.assertEqual(Path(args.out).read_bytes()[data_start:data_start + item.nbytes],
+                             paths[0].read_bytes())
+
+            external_records = common + [
+                kv_string("deepseek41.engram.storage", "external"),
+                array_record("deepseek41.engram.external_paths", GGUF_STRING,
+                             [sidecar.path for sidecar in direct]),
+                array_record("deepseek41.engram.external_offsets", GGUF_UINT64, [0, 0]),
+            ]
+            args.out = str(Path(tmp) / "external.gguf")
+            with contextlib.redirect_stdout(io.StringIO()):
+                write_gguf(args, [], external_records, EmptyDB())
+            external = Path(args.out).read_bytes()
+            self.assertEqual(struct.unpack_from("<Q", external, 8)[0], 0)
+            self.assertNotIn(paths[0].read_bytes(), external)
+
+            (Path(tmp) / "config.json").write_text(json.dumps(config))
+            audit_args = types.SimpleNamespace(
+                hf=tmp, gguf=str(Path(tmp) / "embedded.gguf"),
+                source_revision="0" * 40, payload=False, imatrix=None,
+                quant="q2", quants_library=self.q.lib._name,
+                engram_q4k=[str(path) for path in paths],
+                engram_q4k_dir=None, engram_q4k_external=False)
+            with mock.patch.object(artifact_audit, "SourceDB", return_value=EmptyDB()), \
+                 mock.patch.object(artifact_audit, "build_plan", return_value=[item]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                artifact_audit.validate(audit_args)
+                audit_args.gguf = str(Path(tmp) / "external.gguf")
+                audit_args.engram_q4k_external = True
+                with mock.patch.object(artifact_audit, "build_plan", return_value=[]):
+                    artifact_audit.validate(audit_args)
+            Path(str(paths[0]) + ".json").write_text(json.dumps({
+                "rows": 2, "bytes_per_row": 144, "cols": 256,
+                "block_type": "Q4_K", "ggml_type": QTYPE_Q4_K,
+                "format_version": 1, "complete": True,
+            }))
+            with self.assertRaisesRegex(ValueError, "expected rows=3"):
+                load_engram_q4k(config, None, tmp)
+
     def test_resume(self):
         class DB:
             tensors = {f"test.{i}": dict(shape=[2, 32], dtype="F32") for i in range(3)}
@@ -136,7 +246,9 @@ class ConversionTests(unittest.TestCase):
                    kv_u32("general.alignment", GGUF_ALIGNMENT),
                    kv_string("general.source.revision", "0" * 40),
                    kv_string("deepseek41.quantization", QUANTIZATION["q2"]),
-                   kv_string("deepseek41.calibration", "weight-energy bootstrap")]
+                   kv_string("deepseek41.calibration", "weight-energy bootstrap"),
+                   kv_string("deepseek41.engram.encoding", "e4m3_e8m0_32_row264"),
+                   kv_string("deepseek41.engram.storage", "embedded")]
         original = NativeQuantizer.to_f32
         def interrupted(q, source, name):
             if name == "test.1":
