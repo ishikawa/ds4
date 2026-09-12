@@ -62,18 +62,17 @@ def load_index(path):
     return document, weight_map
 
 
-def load_safetensors_header(path):
-    file_size = os.path.getsize(path)
-    with open(path, "rb") as fp:
-        raw_length = fp.read(8)
-        if len(raw_length) != 8:
-            fail(f"{path}: short safetensors header length")
-        header_length = struct.unpack("<Q", raw_length)[0]
-        if header_length > file_size - 8:
-            fail(f"{path}: header extends beyond file")
-        if header_length > (1 << 30):
-            fail(f"{path}: unreasonable header length {header_length}")
-        raw_header = fp.read(header_length)
+def parse_safetensors_header(raw, file_size, path):
+    if len(raw) < 8:
+        fail(f"{path}: short safetensors header length")
+    header_length = struct.unpack("<Q", raw[:8])[0]
+    if header_length > file_size - 8:
+        fail(f"{path}: header extends beyond file")
+    if header_length > (1 << 30):
+        fail(f"{path}: unreasonable header length {header_length}")
+    if len(raw) != 8 + header_length:
+        fail(f"{path}: short safetensors header")
+    raw_header = raw[8:]
     try:
         document = json.loads(raw_header)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -122,6 +121,21 @@ def load_safetensors_header(path):
     if cursor != payload_size:
         fail(f"{path}: unclaimed payload bytes: {payload_size - cursor}")
     return tensors
+
+
+def load_safetensors_header(path):
+    file_size = os.path.getsize(path)
+    with open(path, "rb") as fp:
+        raw_length = fp.read(8)
+        if len(raw_length) != 8:
+            fail(f"{path}: short safetensors header length")
+        header_length = struct.unpack("<Q", raw_length)[0]
+        if header_length > file_size - 8:
+            fail(f"{path}: header extends beyond file")
+        if header_length > (1 << 30):
+            fail(f"{path}: unreasonable header length {header_length}")
+        raw = raw_length + fp.read(header_length)
+    return parse_safetensors_header(raw, file_size, path)
 
 
 def tensor_scope(name):

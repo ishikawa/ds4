@@ -327,9 +327,10 @@ def write_gguf(args, plan, records, db):
         completed = load_resume_state(journal, signature, plan)
     end = data_start + (plan[completed - 1].offset +
                        align(plan[completed - 1].nbytes, GGUF_ALIGNMENT) if completed else 0)
+    reserve = int(getattr(args, "min_free_gib", 32) * (1 << 30))
     free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
-    if free < data_start + data_bytes - end + (32 << 30):
-        raise ValueError("insufficient disk space for remaining output plus 32 GiB reserve")
+    if free < data_start + data_bytes - end + reserve:
+        raise ValueError("insufficient disk space for remaining output plus reserve")
     header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
     header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
     header += bytes(data_start - len(header))
@@ -343,11 +344,15 @@ def write_gguf(args, plan, records, db):
             fp.flush()
             os.fsync(fp.fileno())
         save_resume_state(journal, signature, 0)
+    if hasattr(db, "conversion_started"):
+        db.conversion_started(plan, completed, data_start)
     with open(partial, "r+b") as fp, concurrent.futures.ThreadPoolExecutor(max_workers=args.threads) as pool:
         fp.truncate(end)
         fp.seek(end)
         for index in range(completed, len(plan)):
             item = plan[index]
+            if hasattr(db, "prepare_item"):
+                db.prepare_item(item, index)
             started = time.monotonic()
             missing = 0
             if fp.tell() != data_start + item.offset:
@@ -377,10 +382,15 @@ def write_gguf(args, plan, records, db):
             fp.flush()
             os.fsync(fp.fileno())
             save_resume_state(journal, signature, index + 1)
+            if hasattr(db, "item_completed"):
+                db.item_completed(item, index + 1,
+                                  data_start + item.offset + align(item.nbytes, GGUF_ALIGNMENT))
             print(f"[{index + 1}/{len(plan)}] {item.name}: {item.nbytes / (1 << 30):.3f} GiB, "
                   f"{time.monotonic() - started:.1f}s, uncalibrated_experts={missing}", flush=True)
     os.rename(partial, args.out)
     os.unlink(journal)
+    if hasattr(db, "conversion_finished"):
+        db.conversion_finished(args.out)
 
 
 def main():

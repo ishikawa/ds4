@@ -295,6 +295,7 @@ class SourceDB:
         index_validator=validate_glm53_index,
         scale_validator=validate_fp8_scales,
         skip_tensors=None,
+        tensor_headers=None,
     ):
         self.hf_dir = hf_dir
         index_path = os.path.join(hf_dir, "model.safetensors.index.json")
@@ -309,9 +310,16 @@ class SourceDB:
 
         for shard in sorted(set(self.weight_map.values())):
             path = os.path.join(hf_dir, shard)
-            if not os.path.isfile(path):
-                fail(f"missing source shard {path}")
-            for name, info in load_safetensors_header(path).items():
+            if tensor_headers is None:
+                if not os.path.isfile(path):
+                    fail(f"missing source shard {path}")
+                header = load_safetensors_header(path)
+            else:
+                try:
+                    header = tensor_headers[shard]["tensors"]
+                except (KeyError, TypeError):
+                    fail(f"missing cached source header for {shard}")
+            for name, info in header.items():
                 if skip_tensors and skip_tensors(name):
                     continue
                 if self.weight_map.get(name) != shard:
