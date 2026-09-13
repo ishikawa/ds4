@@ -547,7 +547,8 @@ tests/test_engram: tests/test_engram.c ds4_engram.c ds4_engram.h tests/fixtures/
 test-engram: tests/test_engram
 	./tests/test_engram
 
-GGML_BUILD ?= ../llama.cpp/build/bin
+GGML_BUILD ?=
+ifneq ($(strip $(GGML_BUILD)),)
 GGML_BASE_LIB ?= $(GGML_BUILD)/libggml-base.dylib
 
 tests/test_engram_ggml: tests/test_engram_ggml.c ds4_engram.c ds4_engram.h $(GGML_BASE_LIB)
@@ -557,6 +558,11 @@ tests/test_engram_ggml: tests/test_engram_ggml.c ds4_engram.c ds4_engram.h $(GGM
 test-engram-ggml: tests/test_engram_ggml
 	@test -n "$(ENGRAM_Q4K_SIDECAR)" || { echo "set ENGRAM_Q4K_SIDECAR to a q4_k_row144 file"; exit 2; }
 	./tests/test_engram_ggml "$(ENGRAM_Q4K_SIDECAR)"
+else
+.PHONY: test-engram-ggml
+test-engram-ggml:
+	@echo "test-engram-ggml: skipped (set GGML_BUILD to a ggml build directory)"
+endif
 
 tests/test_deepseek41_gguf.o: tests/test_deepseek41_gguf.c ds4.c ds4.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<

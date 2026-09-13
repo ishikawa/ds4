@@ -56,6 +56,7 @@
 /tests/test_deepseek41_graph
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
+/tests/test_engram_ggml
 /tests/test_engram
 *.o
 *.dSYM/
