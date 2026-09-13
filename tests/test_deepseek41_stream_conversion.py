@@ -2,6 +2,7 @@
 """Offline tests for shard-at-a-time DeepSeek V4.1 conversion."""
 
 import contextlib
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -20,7 +21,8 @@ sys.path.insert(0, str(ROOT / "gguf-tools"))
 from deepseek41_quantize import QUANTIZATION, write_gguf
 import deepseek41_stream_convert as stream
 from deepseek41_stream_convert import (LocalFetcher, StreamingSourceDB,
-                                       disk_peak, load_headers)
+                                       DiskReservations, disk_peak, fetch_verified,
+                                       load_headers)
 from glm53_quantize import (QTYPE_F32, SourceDB, TensorPlan, align, kv_string,
                             qtype_nbytes)
 
@@ -166,11 +168,107 @@ class StreamingConversionTests(unittest.TestCase):
             self.assertTrue(Path(str(output) + ".partial").exists())
             self.assertTrue((work / "shard-b.safetensors.stream-owned").exists())
 
+            progress_path = Path(str(output) + ".progress.json")
+            progress = json.loads(progress_path.read_text())
+            progress["completed_tensor_count"] = 1
+            progress["completed_tensors"] = [plan[0].name]
+            progress_path.write_text(json.dumps(progress))
+
             db, _ = self.stream_db(source, work, output)
             write_gguf(self.args(output, resume=True), plan, records, db)
             db.close()
             self.assertEqual(output.read_bytes(), expected.read_bytes())
             self.assertFalse((work / "shard-b.safetensors").exists())
+
+    def test_resume_rejects_changed_shard_oid(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(tmp)
+            source, plan, records = self.fixture(root)
+            work = root / "work"; work.mkdir()
+            output = root / "model.gguf"
+            db, _ = self.stream_db(source, work, output)
+            original = db.item_completed
+            def interrupt(item, completed, output_offset):
+                original(item, completed, output_offset)
+                raise OSError("stop")
+            db.item_completed = interrupt
+            with self.assertRaisesRegex(OSError, "stop"):
+                write_gguf(self.args(output), plan, records, db)
+            db.close()
+            db, _ = self.stream_db(source, work, output)
+            db.manifest["shard-a.safetensors"]["oid"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "resume state does not match"):
+                write_gguf(self.args(output, resume=True), plan, records, db)
+            db.close()
+
+    def test_download_hash_recovery_and_completed_partial_promotion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, _, _ = self.fixture(root)
+            work = root / "work"; work.mkdir()
+            output = root / "model.gguf"
+            db, _ = self.stream_db(source, work, output)
+            shard = "shard-a.safetensors"
+            destination = work / shard
+            good = (source / shard).read_bytes()
+            destination.write_bytes(bytes([good[0] ^ 1]) + good[1:])
+            db.acquire(shard)
+            self.assertEqual(destination.read_bytes(), good)
+            db.close()
+
+            work2 = root / "work2"; work2.mkdir()
+            db, _ = self.stream_db(source, work2, output)
+            partial = work2 / f"{shard}.download"
+            partial.write_bytes(good)
+            with mock.patch.object(db.fetcher, "download",
+                                   side_effect=AssertionError("must promote")):
+                db.acquire(shard)
+            self.assertEqual((work2 / shard).read_bytes(), good)
+            self.assertFalse(partial.exists())
+            db.close()
+
+    def test_auxiliary_git_blob_and_disk_reservations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"; source.mkdir()
+            payload = b"revision-pinned metadata"
+            (source / "config.json").write_bytes(payload)
+            header = f"blob {len(payload)}\0".encode()
+            entry = {"kind": "git", "oid": hashlib.sha1(header + payload).hexdigest(),
+                     "size": len(payload)}
+            destination = root / "config.json"
+            destination.write_bytes(b"x" * len(payload))
+            fetch_verified(LocalFetcher(str(source)), "config.json", str(destination), entry)
+            self.assertEqual(destination.read_bytes(), payload)
+
+            ledger = DiskReservations(str(root), 10)
+            with mock.patch.object(stream.shutil, "disk_usage",
+                                   return_value=types.SimpleNamespace(free=100)):
+                ledger.reserve("output", 50)
+                with ledger.hold("download", 30):
+                    self.assertEqual(sum(value[1] for value in ledger.entries.values()), 80)
+                    with self.assertRaisesRegex(ValueError, "min-free-gib"):
+                        with ledger.hold("range", 11):
+                            pass
+                ledger.release("output")
+
+    def test_partial_shard_tensor_uses_one_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, _, _ = self.fixture(root)
+            work = root / "work"; work.mkdir()
+            output = root / "model.gguf"
+            db, _ = self.stream_db(source, work, output)
+            calls = []
+            original = db.fetcher.read_range
+            def counted(*args):
+                calls.append(args)
+                return original(*args)
+            db.fetcher.read_range = counted
+            data = b"".join(db.iter_read("layers.1.engram.q_weight", chunk_size=4))
+            self.assertEqual(len(data), 16)
+            self.assertEqual(len(calls), 1)
+            db.close()
 
     def test_driver_matches_batch_conversion(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -190,8 +288,12 @@ class StreamingConversionTests(unittest.TestCase):
                 quant="q2", imatrix=None, threads=2, prefetch=1, min_free_gib=0,
                 resume=False, dry_run=False, engram_q4k=["unused", "unused"],
                 engram_q4k_dir=None, engram_q4k_external=False,
+                engram_q4k_relative=False,
                 source_dir=str(source), quants_library=self.library)
-            sidecars = [types.SimpleNamespace(path="unused", offset=0)] * 2
+            sidecars = [types.SimpleNamespace(
+                path="unused", offset=0,
+                integrity=lambda embedded: {"size": 0, "rows": 0,
+                                            "sample_sha256": "0" * 64})] * 2
             base_records = [kv_string("general.architecture", "deepseek41")]
             with mock.patch.object(stream, "load_engram_q4k", return_value=sidecars), \
                  mock.patch.object(stream, "metadata",
