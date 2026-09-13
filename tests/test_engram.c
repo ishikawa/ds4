@@ -306,6 +306,10 @@ static void test_q4_k_rows(void) {
     assert(ftruncate(fd, offset + sizeof(raw)) == 0);
     assert(ds4_engram_table_open(&table, path, offset, 2,
                                  DS4_ENGRAM_Q4_K_ROW_BYTES, true));
+    assert(ds4_engram_table_sample_sha256(
+        &table, "48cc351936847c95b8cb432696f6c580ea4a1215eb9e15d910e04a870783dff1"));
+    assert(!ds4_engram_table_sample_sha256(
+        &table, "08cc351936847c95b8cb432696f6c580ea4a1215eb9e15d910e04a870783dff1"));
     assert(ds4_engram_read(&table, ids, 2, actual[0]));
     ds4_engram_table_close(&table);
     assert(ftruncate(fd, offset + sizeof(raw) - 1) == 0);

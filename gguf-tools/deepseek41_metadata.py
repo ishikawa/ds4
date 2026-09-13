@@ -7,6 +7,7 @@ a second implementation of Unicode normalization or NumPy's random generator.
 """
 
 import json
+import hashlib
 import os
 import struct
 
@@ -18,6 +19,34 @@ from glm53_quantize import (
 # Apple Silicon VM pages are 16 KiB. The Engram extent must be removable
 # without also unmapping bytes of the preceding resident tensor.
 GGUF_ALIGNMENT = 16384
+ENGRAM_Q4K_ROW_BYTES = 144
+ENGRAM_SAMPLE_SCHEME = "q4k-row-sha256-v1"
+
+
+def engram_sample_rows(rows):
+    """Rows covered by q4k-row-sha256-v1, in file order without duplicates."""
+    if rows < 0:
+        raise ValueError("negative Engram row count")
+    if rows <= 384:
+        return list(range(rows))
+    selected = set(range(64))
+    selected.update(range(rows - 64, rows))
+    middle = rows - 128
+    selected.update(64 + ((2 * index + 1) * middle) // 512
+                    for index in range(256))
+    return sorted(selected)
+
+
+def engram_sample_sha256(path, rows, offset=0):
+    digest = hashlib.sha256()
+    with open(path, "rb") as fp:
+        for row in engram_sample_rows(rows):
+            fp.seek(offset + row * ENGRAM_Q4K_ROW_BYTES)
+            data = fp.read(ENGRAM_Q4K_ROW_BYTES)
+            if len(data) != ENGRAM_Q4K_ROW_BYTES:
+                raise ValueError(f"{path}: truncated Engram row {row}")
+            digest.update(data)
+    return digest.hexdigest()
 
 
 def array_record(key, kind, values):
@@ -87,7 +116,7 @@ def engram_layout(config, tokenizer):
 
 def metadata(hf_dir, revision, engram_encoding="e4m3_e8m0_32_row264",
              engram_storage="embedded", external_paths=None,
-             external_offsets=None):
+             external_offsets=None, sidecar_integrity=None):
     from tokenizers import Tokenizer
 
     with open(os.path.join(hf_dir, "config.json"), "rb") as fp:
@@ -144,6 +173,18 @@ def metadata(hf_dir, revision, engram_encoding="e4m3_e8m0_32_row264",
         ])
     elif engram_storage != "embedded":
         raise ValueError(f"unknown Engram storage: {engram_storage}")
+    if sidecar_integrity is not None:
+        if len(sidecar_integrity) != len(layout["layers"]):
+            raise ValueError("Engram integrity needs one entry per layer")
+        records.extend([
+            array_record("deepseek41.engram.sidecar_size", GGUF_UINT64,
+                         [item["size"] for item in sidecar_integrity]),
+            array_record("deepseek41.engram.sidecar_rows", GGUF_UINT64,
+                         [item["rows"] for item in sidecar_integrity]),
+            array_record("deepseek41.engram.sidecar_sample_sha256", GGUF_STRING,
+                         [item["sample_sha256"] for item in sidecar_integrity]),
+            kv_string("deepseek41.engram.sidecar_sample_scheme", ENGRAM_SAMPLE_SCHEME),
+        ])
     for key in (
         "vocab_size", "hidden_size", "moe_intermediate_size", "num_hidden_layers",
         "num_attention_heads", "num_key_value_heads", "head_dim", "qk_rope_head_dim",

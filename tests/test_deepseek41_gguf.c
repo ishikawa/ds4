@@ -65,8 +65,10 @@ static int run_fixture(int bad_layout, int q4) {
               q4 ? "q4_k_row144" : "e4m3_e8m0_32_row264");
     putstr(fp, "general.alignment"); put32(fp, GGUF_VALUE_UINT32); put32(fp, ALIGN);
     tensor(fp, "test.weight", DS4_TENSOR_F32, 16, 1, 0);
-    tensor(fp, "blk.1.engram_embd.weight", 24, row_bytes, rows, first - ALIGN);
-    tensor(fp, "blk.14.engram_embd.weight", 24, row_bytes, rows, second - ALIGN);
+    tensor(fp, "blk.1.engram_embd.weight", q4 ? DS4_TENSOR_Q4_K : DS4_TENSOR_I8,
+           q4 ? DS4_ENGRAM_DIM : row_bytes, rows, first - ALIGN);
+    tensor(fp, "blk.14.engram_embd.weight", q4 ? DS4_TENSOR_Q4_K : DS4_TENSOR_I8,
+           q4 ? DS4_ENGRAM_DIM : row_bytes, rows, second - ALIGN);
     assert(ftell(fp) < ALIGN);
     assert(fflush(fp) == 0 && ftruncate(fd, (off_t)file_size) == 0);
     uint8_t row[DS4_ENGRAM_MAX_ROW_BYTES];
@@ -144,6 +146,25 @@ static void run_external_fixture(void) {
     assert(fclose(fp) == 0 && unlink(path) == 0);
 }
 
+static void test_external_paths(void) {
+    char directory[] = "/tmp/ds41-paths.XXXXXX";
+    assert(mkdtemp(directory));
+    char model[PATH_MAX], sidecar[PATH_MAX];
+    snprintf(model, sizeof(model), "%s/model.gguf", directory);
+    snprintf(sidecar, sizeof(sidecar), "%s/rows.bin", directory);
+    int fd = open(sidecar, O_CREAT | O_WRONLY, 0600); assert(fd >= 0); close(fd);
+    ds4_str relative = {.ptr = "rows.bin", .len = 8};
+    char *resolved = ds4_engram_resolve_path(model, relative.ptr, relative.len, false);
+    assert(resolved && !strcmp(resolved, sidecar)); free(resolved);
+    ds4_str escape = {.ptr = "../outside.bin", .len = 14};
+    assert(!ds4_engram_resolve_path(model, escape.ptr, escape.len, false));
+    ds4_str absolute = {.ptr = sidecar, .len = strlen(sidecar)};
+    assert(!ds4_engram_resolve_path(model, absolute.ptr, absolute.len, false));
+    resolved = ds4_engram_resolve_path(model, absolute.ptr, absolute.len, true);
+    assert(resolved && !strcmp(resolved, sidecar)); free(resolved);
+    assert(unlink(sidecar) == 0 && rmdir(directory) == 0);
+}
+
 static void check_model_layout(const char *path) {
     ds4_model m;
     model_open(&m, path, false, false);
@@ -181,6 +202,7 @@ int main(int argc, char **argv) {
     run_fixture(0, 1);
     run_fixture(1, 0);
     run_external_fixture();
+    test_external_paths();
     puts("V4.1 disk-only GGUF extent: PASS");
     return 0;
 }

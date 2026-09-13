@@ -6,13 +6,15 @@ samples native or Q4_K Engram rows. External sidecars are checked for schema,
 size and metadata identity. This is artifact validation, not inference QA.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import random
 import sys
 
-from deepseek41_metadata import GGUF_ALIGNMENT
+from deepseek41_metadata import (ENGRAM_SAMPLE_SCHEME, GGUF_ALIGNMENT,
+                                 engram_sample_sha256)
 from deepseek41_quantize import (SourceDB, NativeQuantizer, Imatrix, build_plan,
                                   validate_scales, scale_name, QUANTIZATION,
                                   load_engram_q4k, ENGRAM_Q4K_ROW_BYTES)
@@ -83,6 +85,20 @@ def read_engram_metadata(fp, kind):
     raise ValueError(f"unsupported selected metadata array type {element}")
 
 
+def full_table_sha256(path, rows, offset):
+    digest = hashlib.sha256()
+    remaining = rows * ENGRAM_Q4K_ROW_BYTES
+    with open(path, "rb") as fp:
+        fp.seek(offset)
+        while remaining:
+            chunk = fp.read(min(8 << 20, remaining))
+            if not chunk:
+                raise ValueError(f"{path}: truncated Q4_K table")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
 def validate(args):
     config = json.loads((Path(args.hf) / "config.json").read_text())
     files = getattr(args, "engram_q4k", None)
@@ -109,7 +125,11 @@ def validate(args):
                             "deepseek41.calibration", "deepseek41.quantization",
                             "deepseek41.engram.encoding", "deepseek41.engram.storage",
                             "deepseek41.engram.external_paths",
-                            "deepseek41.engram.external_offsets"}:
+                            "deepseek41.engram.external_offsets",
+                            "deepseek41.engram.sidecar_size",
+                            "deepseek41.engram.sidecar_rows",
+                            "deepseek41.engram.sidecar_sample_sha256",
+                            "deepseek41.engram.sidecar_sample_scheme"}:
                     if key in metadata:
                         raise ValueError(f"duplicate metadata: {key}")
                     metadata[key] = read_engram_metadata(fp, kind)
@@ -122,8 +142,21 @@ def validate(args):
                         "deepseek41.calibration": "imatrix" if args.imatrix else "weight-energy bootstrap",
                         "deepseek41.engram.encoding": "q4_k_row144" if sidecars else "e4m3_e8m0_32_row264",
                         "deepseek41.engram.storage": "external" if external else "embedded"}
+            if sidecars:
+                integrity = [item.integrity(not external) for item in sidecars]
+                expected.update({
+                    "deepseek41.engram.sidecar_size": [item["size"] for item in integrity],
+                    "deepseek41.engram.sidecar_rows": [item["rows"] for item in integrity],
+                    "deepseek41.engram.sidecar_sample_sha256":
+                        [item["sample_sha256"] for item in integrity],
+                    "deepseek41.engram.sidecar_sample_scheme": ENGRAM_SAMPLE_SCHEME,
+                })
             if external:
-                expected["deepseek41.engram.external_paths"] = [item.path for item in sidecars]
+                paths = [item.path for item in sidecars]
+                if getattr(args, "engram_q4k_relative", False):
+                    base = os.path.dirname(os.path.abspath(args.gguf))
+                    paths = [os.path.relpath(path, base) for path in paths]
+                expected["deepseek41.engram.external_paths"] = paths
                 expected["deepseek41.engram.external_offsets"] = [item.offset for item in sidecars]
             if metadata != expected:
                 raise ValueError(f"metadata mismatch: {metadata}")
@@ -145,6 +178,15 @@ def validate(args):
             for item in plan:
                 if item.role == "engram_q4k":
                     check_payload(fp, start + item.offset, item, db, None, None)
+            if external:
+                for item, expected_hash in zip(
+                        sidecars, metadata["deepseek41.engram.sidecar_sample_sha256"]):
+                    actual = engram_sample_sha256(item.path, item.rows, item.offset)
+                    if actual != expected_hash:
+                        raise ValueError(f"{item.path}: Engram sample sha256 mismatch")
+                    if getattr(args, "full", False):
+                        digest = full_table_sha256(item.path, item.rows, item.offset)
+                        print(f"PASS: full Engram sha256 {digest}  {item.path}", flush=True)
             if args.payload:
                 q = NativeQuantizer(args.quants_library)
                 imatrix = Imatrix(args.imatrix, q.np)
@@ -167,10 +209,13 @@ if __name__ == "__main__":
     parser.add_argument("--quant", choices=QUANTIZATION, default="q2")
     parser.add_argument("--imatrix")
     parser.add_argument("--payload", action="store_true")
+    parser.add_argument("--full", action="store_true",
+                        help="read and hash every external Engram row")
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--engram-q4k", action="append", metavar="[LAYER=]FILE")
     source.add_argument("--engram-q4k-dir", metavar="DIR")
     parser.add_argument("--engram-q4k-external", action="store_true")
+    parser.add_argument("--engram-q4k-relative", action="store_true")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=str(Path(__file__).with_name(f"libds4quants.{suffix}")))
     args = parser.parse_args()

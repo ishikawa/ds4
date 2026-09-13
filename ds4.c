@@ -2603,6 +2603,19 @@ static bool model_engram_format(const ds4_model *m, uint32_t *row_bytes,
     return !*external || *row_bytes == DS4_ENGRAM_Q4_K_ROW_BYTES;
 }
 
+static bool model_engram_tensor_format(const ds4_tensor *t, uint32_t *row_bytes) {
+    if (t->ndim != 2 || !t->dim[1] || t->dim[1] > UINT32_MAX) return false;
+    if (t->type == DS4_TENSOR_Q4_K && t->dim[0] == DS4_ENGRAM_DIM) {
+        *row_bytes = DS4_ENGRAM_Q4_K_ROW_BYTES;
+        return true;
+    }
+    if (t->type == DS4_TENSOR_I8 && t->dim[0] == DS4_ENGRAM_FP8_ROW_BYTES) {
+        *row_bytes = DS4_ENGRAM_FP8_ROW_BYTES;
+        return true;
+    }
+    return false;
+}
+
 static void model_unmap_engram(ds4_model *m) {
     ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
@@ -2619,8 +2632,9 @@ static void model_unmap_engram(ds4_model *m) {
         int index = ds4_streq(t->name, "blk.1.engram_embd.weight") ? 0 :
                     ds4_streq(t->name, "blk.14.engram_embd.weight") ? 1 : -1;
         if (index >= 0) {
-            if (tables[index] || t->ndim != 2 || t->type != DS4_TENSOR_I8 ||
-                t->dim[0] != row_bytes || !t->dim[1] || t->dim[1] > UINT32_MAX)
+            uint32_t tensor_row_bytes = 0;
+            if (tables[index] || !model_engram_tensor_format(t, &tensor_row_bytes) ||
+                tensor_row_bytes != row_bytes)
                 ds4_die("invalid or duplicate V4.1 Engram tensor");
             tables[index] = t;
         } else {
@@ -6496,7 +6510,10 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
             if (t) ds4_die("external V4.1 Engram must not contain table tensors");
         } else {
             if (!t) ds4_die("V4.1 GGUF is missing an Engram table");
-            tensor_expect_layout(t, DS4_TENSOR_I8, 2, row_bytes, rows[i], 0);
+            uint32_t tensor_row_bytes = 0;
+            if (!model_engram_tensor_format(t, &tensor_row_bytes) ||
+                tensor_row_bytes != row_bytes || t->dim[1] != rows[i])
+                ds4_die("invalid V4.1 Engram tensor layout");
             if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
         }
     }
@@ -39250,24 +39267,6 @@ static bool ds41_read_string_array(const ds4_model *m, const char *key,
     return true;
 }
 
-static char *ds41_engram_path(const char *gguf_path, ds4_str path) {
-    if (memchr(path.ptr, '\0', path.len)) return NULL;
-    const char *slash = strrchr(gguf_path, '/');
-    const size_t directory = slash ? (size_t)(slash - gguf_path + 1) : 0;
-    const bool absolute = path.ptr[0] == '/';
-    if (path.len > SIZE_MAX - (absolute ? 1 : directory + 1)) return NULL;
-    char *result = malloc((absolute ? 0 : directory) + path.len + 1);
-    if (!result) return NULL;
-    size_t pos = 0;
-    if (!absolute && directory) {
-        memcpy(result, gguf_path, directory);
-        pos = directory;
-    }
-    memcpy(result + pos, path.ptr, path.len);
-    result[pos + path.len] = '\0';
-    return result;
-}
-
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
     for (uint32_t i = 0; g->rows_view && i < g->prefill_cap; i++) {
@@ -39359,7 +39358,8 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
 
 static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model *m,
                                               const ds4_weights *w, const char *path,
-                                              uint32_t ctx, bool streaming) {
+                                              uint32_t ctx, bool streaming,
+                                              bool allow_engram_outside) {
     memset(g, 0, sizeof(*g));
     g->table[0].fd = g->table[1].fd = -1;
     if (!ctx || ctx > 1048576 || DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) return false;
@@ -39395,19 +39395,60 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     if (!model_engram_format(m, &row_bytes, &external)) goto fail;
     ds4_str external_paths[DS4_ENGRAM_LAYERS];
     uint64_t external_offsets[DS4_ENGRAM_LAYERS];
+    uint64_t sidecar_sizes[DS4_ENGRAM_LAYERS], sidecar_rows[DS4_ENGRAM_LAYERS];
+    ds4_str sidecar_hashes[DS4_ENGRAM_LAYERS];
+    bool verify_sidecars = false;
     if (external &&
         (!ds41_read_string_array(m, "deepseek41.engram.external_paths", external_paths) ||
          !ds41_read_array(m, "deepseek41.engram.external_offsets", GGUF_VALUE_UINT64,
                           DS4_ENGRAM_LAYERS, external_offsets,
                           sizeof(external_offsets)))) goto fail;
+    if (external) {
+        ds4_array_ref probe;
+        ds4_str scheme = {0};
+        bool any = model_get_array(m, "deepseek41.engram.sidecar_size", &probe) ||
+                   model_get_array(m, "deepseek41.engram.sidecar_rows", &probe) ||
+                   model_get_array(m, "deepseek41.engram.sidecar_sample_sha256", &probe) ||
+                   model_get_string(m, "deepseek41.engram.sidecar_sample_scheme", &scheme);
+        if (any) {
+            if (!ds41_read_array(m, "deepseek41.engram.sidecar_size", GGUF_VALUE_UINT64,
+                                 DS4_ENGRAM_LAYERS, sidecar_sizes, sizeof(sidecar_sizes)) ||
+                !ds41_read_array(m, "deepseek41.engram.sidecar_rows", GGUF_VALUE_UINT64,
+                                 DS4_ENGRAM_LAYERS, sidecar_rows, sizeof(sidecar_rows)) ||
+                !ds41_read_string_array(m, "deepseek41.engram.sidecar_sample_sha256",
+                                        sidecar_hashes) ||
+                !model_get_string(m, "deepseek41.engram.sidecar_sample_scheme", &scheme) ||
+                !ds4_streq(scheme, "q4k-row-sha256-v1"))
+                ds4_die("external V4.1 Engram integrity metadata is incomplete");
+            verify_sidecars = true;
+        } else {
+            fprintf(stderr, "ds4: warning: external V4.1 Engram has no integrity metadata\n");
+        }
+    }
     for (uint32_t i = 0; i < 2; i++) {
         const uint32_t il = i ? 14u : 1u;
         if (external) {
-            char *sidecar = ds41_engram_path(path, external_paths[i]);
+            char *sidecar = ds4_engram_resolve_path(path, external_paths[i].ptr,
+                                                    external_paths[i].len,
+                                                    allow_engram_outside);
             if (!sidecar) ds4_die("invalid external V4.1 Engram path");
             if (!ds4_engram_table_open(&g->table[i], sidecar, external_offsets[i],
                                        g->engram.rows[i], row_bytes, true))
                 ds4_die_errno("cannot open external Engram table", sidecar);
+            if (verify_sidecars) {
+                struct stat st;
+                char expected[65];
+                if (sidecar_rows[i] != g->engram.rows[i] ||
+                    fstat(g->table[i].fd, &st) || st.st_size < 0 ||
+                    sidecar_sizes[i] != (uint64_t)st.st_size ||
+                    sidecar_hashes[i].len != 64) {
+                    errno = EINVAL;
+                    ds4_die_errno("external Engram integrity mismatch", sidecar);
+                }
+                memcpy(expected, sidecar_hashes[i].ptr, 64); expected[64] = '\0';
+                if (!ds4_engram_table_sample_sha256(&g->table[i], expected))
+                    ds4_die_errno("external Engram sample sha256 mismatch", sidecar);
+            }
             free(sidecar);
         } else {
             const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
@@ -41100,6 +41141,7 @@ struct ds4_engine {
     bool vision_ready;
     bool vision_map_ready;
     bool share_session_prefill_workspace;
+    bool allow_external_engram_outside;
 #ifndef DS4_NO_GPU
     bool shared_prefill_workspace_ready;
     ds4_gpu_graph shared_prefill_workspace;
@@ -60285,7 +60327,8 @@ static int ds4_engine_collect_sequential_imatrix(
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
-                              (uint32_t)ctx_size, e->ssd_streaming)) return 1;
+                              (uint32_t)ctx_size, e->ssd_streaming,
+                              e->allow_external_engram_outside)) return 1;
     } else
 #endif
     if (!glm_graph_alloc(&g, &e->model, &e->weights, ctx_size,
@@ -65714,6 +65757,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    e->allow_external_engram_outside = opt->allow_external_engram_outside;
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -67739,7 +67783,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
                 ds41_graph_bytes((uint32_t)ctx_size)), false) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
-                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming)) {
+                              e->model_path, (uint32_t)ctx_size, e->ssd_streaming,
+                              e->allow_external_engram_outside)) {
             free(s);
             return 1;
         }

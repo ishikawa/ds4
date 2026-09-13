@@ -22,7 +22,7 @@ from deepseek41_quantize import (NativeQuantizer, validate_scales, write_engram,
                                 write_gguf, scale_name, QUANTIZATION, build_plan,
                                 load_engram_q4k, write_engram_q4k)
 from deepseek41_metadata import (GGUF_ALIGNMENT, engram_layout, metadata,
-                                 array_record)
+                                 array_record, ENGRAM_SAMPLE_SCHEME)
 import deepseek41_validate_gguf as artifact_audit
 import glm53_quantize as quantize_common
 from glm53_quantize import (
@@ -160,7 +160,7 @@ class ConversionTests(unittest.TestCase):
             direct = load_engram_q4k(config, [f"1={paths[0]}", f"14={paths[1]}"], None)
             by_dir = load_engram_q4k(config, None, tmp)
             self.assertEqual(direct, by_dir)
-            item = TensorPlan("blk.1.engram_embd.weight", (144, 3), QTYPE_I8,
+            item = TensorPlan("blk.1.engram_embd.weight", (256, 3), QTYPE_Q4_K,
                               "engram_q4k", source=str(paths[0]))
             item.nbytes = 3 * 144
             output = io.BytesIO()
@@ -182,7 +182,17 @@ class ConversionTests(unittest.TestCase):
             args = types.SimpleNamespace(imatrix=None, quants_library=self.q.lib._name,
                                          threads=1, resume=False)
             item.offset = 0
-            embedded_records = common + [kv_string("deepseek41.engram.storage", "embedded")]
+            integrity = [sidecar.integrity(True) for sidecar in direct]
+            integrity_records = [
+                array_record("deepseek41.engram.sidecar_size", GGUF_UINT64,
+                             [entry["size"] for entry in integrity]),
+                array_record("deepseek41.engram.sidecar_rows", GGUF_UINT64,
+                             [entry["rows"] for entry in integrity]),
+                array_record("deepseek41.engram.sidecar_sample_sha256", GGUF_STRING,
+                             [entry["sample_sha256"] for entry in integrity]),
+                kv_string("deepseek41.engram.sidecar_sample_scheme", ENGRAM_SAMPLE_SCHEME),
+            ]
+            embedded_records = common + [kv_string("deepseek41.engram.storage", "embedded")] + integrity_records
             args.out = str(Path(tmp) / "embedded.gguf")
             with contextlib.redirect_stdout(io.StringIO()):
                 write_gguf(args, [item], embedded_records, EmptyDB())
@@ -195,7 +205,7 @@ class ConversionTests(unittest.TestCase):
                 array_record("deepseek41.engram.external_paths", GGUF_STRING,
                              [sidecar.path for sidecar in direct]),
                 array_record("deepseek41.engram.external_offsets", GGUF_UINT64, [0, 0]),
-            ]
+            ] + integrity_records
             args.out = str(Path(tmp) / "external.gguf")
             with contextlib.redirect_stdout(io.StringIO()):
                 write_gguf(args, [], external_records, EmptyDB())
@@ -207,6 +217,7 @@ class ConversionTests(unittest.TestCase):
             audit_args = types.SimpleNamespace(
                 hf=tmp, gguf=str(Path(tmp) / "embedded.gguf"),
                 source_revision="0" * 40, payload=False, imatrix=None,
+                full=False,
                 quant="q2", quants_library=self.q.lib._name,
                 engram_q4k=[str(path) for path in paths],
                 engram_q4k_dir=None, engram_q4k_external=False)
@@ -218,6 +229,11 @@ class ConversionTests(unittest.TestCase):
                 audit_args.engram_q4k_external = True
                 with mock.patch.object(artifact_audit, "build_plan", return_value=[]):
                     artifact_audit.validate(audit_args)
+                    original = paths[0].read_bytes()
+                    paths[0].write_bytes(bytes([original[0] ^ 1]) + original[1:])
+                    with self.assertRaisesRegex(ValueError, "metadata mismatch|sha256 mismatch"):
+                        artifact_audit.validate(audit_args)
+                    paths[0].write_bytes(original)
             Path(str(paths[0]) + ".json").write_text(json.dumps({
                 "rows": 2, "bytes_per_row": 144, "cols": 256,
                 "block_type": "Q4_K", "ggml_type": QTYPE_Q4_K,

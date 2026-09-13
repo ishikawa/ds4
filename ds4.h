@@ -168,6 +168,7 @@ typedef struct {
     bool share_session_prefill_workspace;
     bool first_token_test;
     bool metal_graph_test;
+    bool allow_external_engram_outside;
     bool load_slice;
     uint32_t load_layer_start;
     uint32_t load_layer_end;

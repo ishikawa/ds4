@@ -47,12 +47,17 @@ typedef struct {
     uint32_t row_bytes;
 } ds4_engram_table;
 
+char *ds4_engram_resolve_path(const char *gguf_path, const char *path,
+                              size_t path_len, bool allow_outside);
+
 /* A separate uncached file descriptor, never an mmap or Metal model view.
  * exact_size is used for standalone sidecars; embedded tables may have data
  * after their extent in the same GGUF. */
 bool ds4_engram_table_open(ds4_engram_table *table, const char *path,
                            uint64_t offset, uint32_t rows, uint32_t row_bytes,
                            bool exact_size);
+bool ds4_engram_table_sample_sha256(const ds4_engram_table *table,
+                                    const char expected_hex[65]);
 void ds4_engram_table_close(ds4_engram_table *table);
 /* Output uses F32 storage; FP8 rows retain the reference's BF16 rounding while
  * Q4_K rows are directly dequantized. No whole-table allocation. */

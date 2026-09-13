@@ -18,7 +18,8 @@ import struct
 import sys
 import time
 
-from deepseek41_metadata import GGUF_ALIGNMENT, metadata
+from deepseek41_metadata import (GGUF_ALIGNMENT, engram_sample_sha256,
+                                 metadata)
 from glm53_quantize import (
     SourceDB, TensorPlan, Quantizer, Imatrix, QTYPE_F32, QTYPE_F16,
     QTYPE_Q8_0, QTYPE_Q2_K, QTYPE_Q4_K, QTYPE_IQ2_XXS, QTYPE_I8, align,
@@ -40,6 +41,13 @@ class EngramQ4K:
     path: str
     rows: int
     offset: int = 0
+
+    def integrity(self, embedded=False):
+        return {
+            "size": self.rows * ENGRAM_Q4K_ROW_BYTES if embedded else os.path.getsize(self.path),
+            "rows": self.rows,
+            "sample_sha256": engram_sample_sha256(self.path, self.rows, self.offset),
+        }
 
 
 def load_engram_q4k(config, files=None, directory=None):
@@ -209,7 +217,7 @@ def build_plan(db, config, quant="q2", engram_q4k=None, engram_external=False):
                     raise ValueError(f"layer {layer}: Engram sidecar row mismatch")
                 if not engram_external:
                     disk.append(TensorPlan(f"{dst}.engram_embd.weight",
-                                           (ENGRAM_Q4K_ROW_BYTES, rows), QTYPE_I8,
+                                           (256, rows), QTYPE_Q4_K,
                                            "engram_q4k", source=sidecar.path,
                                            row_start=sidecar.offset, raw_copy=True))
             else:
@@ -317,7 +325,13 @@ def write_gguf(args, plan, records, db):
     signature = conversion_signature(plan, records, [], args.imatrix)
     # A metadata/recipe match alone cannot distinguish two source downloads.
     source_identity = [(name, db.info(name)) for name in sorted(db.tensors)]
-    signature = hashlib.sha256((signature + json.dumps(source_identity, sort_keys=True)).encode()).hexdigest()
+    resume_identity = {
+        "sources": source_identity,
+        "row_starts": [(item.name, item.row_start) for item in plan],
+        "driver": db.signature_identity() if hasattr(db, "signature_identity") else None,
+    }
+    signature = hashlib.sha256(
+        (signature + json.dumps(resume_identity, sort_keys=True)).encode()).hexdigest()
     if os.path.exists(args.out):
         raise ValueError(f"refusing to overwrite {args.out}")
     completed = 0
@@ -325,12 +339,21 @@ def write_gguf(args, plan, records, db):
         if not args.resume or not (os.path.exists(partial) and os.path.exists(journal)):
             raise ValueError("partial file and journal require --resume")
         completed = load_resume_state(journal, signature, plan)
+        if hasattr(db, "reconcile_completed"):
+            reconciled = db.reconcile_completed(plan, completed)
+            if reconciled != completed:
+                completed = reconciled
+                save_resume_state(journal, signature, completed)
     end = data_start + (plan[completed - 1].offset +
                        align(plan[completed - 1].nbytes, GGUF_ALIGNMENT) if completed else 0)
-    reserve = int(getattr(args, "min_free_gib", 32) * (1 << 30))
-    free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
-    if free < data_start + data_bytes - end + reserve:
-        raise ValueError("insufficient disk space for remaining output plus reserve")
+    remaining_output = data_start + data_bytes - end
+    if hasattr(db, "reserve_output"):
+        db.reserve_output(remaining_output, args.out)
+    else:
+        reserve = int(getattr(args, "min_free_gib", 32) * (1 << 30))
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(args.out))).free
+        if free < remaining_output + reserve:
+            raise ValueError("insufficient disk space for remaining output plus reserve")
     header = b"GGUF" + struct.pack("<IQQ", 3, len(plan), len(records))
     header += b"".join(records) + b"".join(tensor_header(item) for item in plan)
     header += bytes(data_start - len(header))
@@ -343,6 +366,8 @@ def write_gguf(args, plan, records, db):
             fp.write(header)
             fp.flush()
             os.fsync(fp.fileno())
+        if hasattr(db, "consume_output"):
+            db.consume_output(data_start)
         save_resume_state(journal, signature, 0)
     if hasattr(db, "conversion_started"):
         db.conversion_started(plan, completed, data_start)
@@ -381,6 +406,8 @@ def write_gguf(args, plan, records, db):
             fp.write(bytes(align(item.nbytes, GGUF_ALIGNMENT) - item.nbytes))
             fp.flush()
             os.fsync(fp.fileno())
+            if hasattr(db, "consume_output"):
+                db.consume_output(align(item.nbytes, GGUF_ALIGNMENT))
             save_resume_state(journal, signature, index + 1)
             if hasattr(db, "item_completed"):
                 db.item_completed(item, index + 1,
@@ -410,6 +437,8 @@ def main():
                         help="directory containing engram-{layer}.q4_k.bin")
     parser.add_argument("--engram-q4k-external", action="store_true",
                         help="reference Q4_K sidecars instead of embedding them")
+    parser.add_argument("--engram-q4k-relative", action="store_true",
+                        help="store external sidecars relative to the output GGUF")
     suffix = "dylib" if sys.platform == "darwin" else "so"
     parser.add_argument("--quants-library", default=os.path.join(os.path.dirname(__file__), f"libds4quants.{suffix}"))
     args = parser.parse_args()
@@ -425,12 +454,22 @@ def main():
                                    args.engram_q4k_dir)
     elif args.engram_q4k_external:
         parser.error("--engram-q4k-external requires Q4_K sidecars")
+    if args.engram_q4k_relative and not args.engram_q4k_external:
+        parser.error("--engram-q4k-relative requires --engram-q4k-external")
     storage = "external" if args.engram_q4k_external else "embedded"
+    external_paths = None
+    if args.engram_q4k_external:
+        external_paths = [item.path for item in sidecars]
+        if args.engram_q4k_relative:
+            base = os.path.dirname(os.path.abspath(args.out))
+            external_paths = [os.path.relpath(path, base) for path in external_paths]
     config, records = metadata(
         args.hf, args.source_revision,
         "q4_k_row144" if sidecars else "e4m3_e8m0_32_row264", storage,
-        [item.path for item in sidecars] if args.engram_q4k_external else None,
-        [item.offset for item in sidecars] if args.engram_q4k_external else None)
+        external_paths,
+        [item.offset for item in sidecars] if args.engram_q4k_external else None,
+        [item.integrity(not args.engram_q4k_external) for item in sidecars]
+        if sidecars else None)
     db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=validate_scales,
                   skip_tensors=(lambda name: ".engram.embed." in name)
                   if sidecars else None)
