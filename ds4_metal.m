@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <mach/mach.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 #include <objc/runtime.h>
 
@@ -1331,6 +1332,188 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+typedef struct {
+    uint64_t command_buffers;
+    uint64_t gpu_time_samples;
+    uint64_t kernel_time_samples;
+    uint64_t commit_to_start_samples;
+    double gpu_busy_seconds;
+    double kernel_seconds;
+    double commit_to_start_seconds;
+    double wall_start_seconds;
+} ds4_gpu_time_profile_stats;
+
+static BOOL g_gpu_time_profile_enabled;
+static BOOL g_gpu_time_profile_decode_started;
+static pthread_mutex_t g_gpu_time_profile_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_gpu_time_profile_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t g_gpu_time_profile_outstanding;
+static ds4_gpu_time_profile_stats g_gpu_time_profile_total;
+static ds4_gpu_time_profile_stats g_gpu_time_profile_decode;
+static mach_timebase_info_data_t g_gpu_time_profile_timebase;
+
+static double ds4_gpu_time_profile_now_seconds(void) {
+    return (double)mach_absolute_time() *
+           (double)g_gpu_time_profile_timebase.numer /
+           (double)g_gpu_time_profile_timebase.denom * 1.0e-9;
+}
+
+static void ds4_gpu_time_profile_reset(void) {
+    g_gpu_time_profile_enabled =
+        getenv("DS4_METAL_GPU_TIME_PROFILE") != NULL;
+    g_gpu_time_profile_decode_started = NO;
+    g_gpu_time_profile_outstanding = 0;
+    g_gpu_time_profile_total = (ds4_gpu_time_profile_stats){0};
+    g_gpu_time_profile_decode = (ds4_gpu_time_profile_stats){0};
+    if (g_gpu_time_profile_enabled) {
+        (void)mach_timebase_info(&g_gpu_time_profile_timebase);
+    }
+}
+
+static void ds4_gpu_time_profile_note_decode_started(void) {
+    if (!g_gpu_time_profile_enabled) return;
+    pthread_mutex_lock(&g_gpu_time_profile_mutex);
+    g_gpu_time_profile_decode_started = YES;
+    pthread_mutex_unlock(&g_gpu_time_profile_mutex);
+}
+
+static void ds4_gpu_time_profile_add_sample(
+        ds4_gpu_time_profile_stats *stats,
+        double                      commit_seconds,
+        double                      gpu_start,
+        double                      gpu_end,
+        double                      kernel_start,
+        double                      kernel_end) {
+    stats->command_buffers++;
+    if (gpu_start > 0.0 && gpu_end >= gpu_start) {
+        stats->gpu_time_samples++;
+        stats->gpu_busy_seconds += gpu_end - gpu_start;
+    }
+    if (kernel_start > 0.0 && kernel_end >= kernel_start) {
+        stats->kernel_time_samples++;
+        stats->kernel_seconds += kernel_end - kernel_start;
+    }
+    /* Metal command-buffer timestamps and mach_absolute_time share the host
+     * monotonic timebase.  Reject unavailable or inconsistent samples. */
+    if (gpu_start >= commit_seconds) {
+        stats->commit_to_start_samples++;
+        stats->commit_to_start_seconds += gpu_start - commit_seconds;
+    }
+}
+
+/* This is the only wrapper for MTLCommandBuffer commit.  The disabled branch
+ * registers no completion handler and performs the original commit directly. */
+static void ds4_gpu_commit_command_buffer(id<MTLCommandBuffer> cb) {
+    if (!g_gpu_time_profile_enabled) {
+        [cb commit];
+        return;
+    }
+
+    const double profile_start_seconds = ds4_gpu_time_profile_now_seconds();
+    __block double commit_seconds = 0.0;
+    pthread_mutex_lock(&g_gpu_time_profile_mutex);
+    const BOOL decode = g_gpu_time_profile_decode_started;
+    if (g_gpu_time_profile_total.wall_start_seconds == 0.0) {
+        g_gpu_time_profile_total.wall_start_seconds = profile_start_seconds;
+    }
+    if (decode && g_gpu_time_profile_decode.wall_start_seconds == 0.0) {
+        g_gpu_time_profile_decode.wall_start_seconds = profile_start_seconds;
+    }
+    g_gpu_time_profile_outstanding++;
+    pthread_mutex_unlock(&g_gpu_time_profile_mutex);
+
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+        const double gpu_start = done.GPUStartTime;
+        const double gpu_end = done.GPUEndTime;
+        const double kernel_start = done.kernelStartTime;
+        const double kernel_end = done.kernelEndTime;
+        pthread_mutex_lock(&g_gpu_time_profile_mutex);
+        ds4_gpu_time_profile_add_sample(&g_gpu_time_profile_total,
+                                        commit_seconds,
+                                        gpu_start,
+                                        gpu_end,
+                                        kernel_start,
+                                        kernel_end);
+        if (decode) {
+            ds4_gpu_time_profile_add_sample(&g_gpu_time_profile_decode,
+                                            commit_seconds,
+                                            gpu_start,
+                                            gpu_end,
+                                            kernel_start,
+                                            kernel_end);
+        }
+        if (g_gpu_time_profile_outstanding > 0 &&
+            --g_gpu_time_profile_outstanding == 0) {
+            pthread_cond_broadcast(&g_gpu_time_profile_cond);
+        }
+        pthread_mutex_unlock(&g_gpu_time_profile_mutex);
+    }];
+    commit_seconds = ds4_gpu_time_profile_now_seconds();
+    [cb commit];
+}
+
+static void ds4_gpu_time_profile_print_one(
+        const char                       *scope,
+        ds4_gpu_time_profile_stats        stats,
+        double                            now_seconds,
+        uint64_t                          decode_tokens) {
+    const double gpu_avg_ms = stats.gpu_time_samples ?
+        stats.gpu_busy_seconds * 1.0e3 / (double)stats.gpu_time_samples : 0.0;
+    const double kernel_avg_ms = stats.kernel_time_samples ?
+        stats.kernel_seconds * 1.0e3 / (double)stats.kernel_time_samples : 0.0;
+    const double commit_avg_ms = stats.commit_to_start_samples ?
+        stats.commit_to_start_seconds * 1.0e3 /
+            (double)stats.commit_to_start_samples : 0.0;
+    const double wall_seconds = stats.wall_start_seconds > 0.0 ?
+        now_seconds - stats.wall_start_seconds : 0.0;
+    const double busy_percent = wall_seconds > 0.0 ?
+        100.0 * stats.gpu_busy_seconds / wall_seconds : 0.0;
+    const double idle_seconds = wall_seconds > stats.gpu_busy_seconds ?
+        wall_seconds - stats.gpu_busy_seconds : 0.0;
+    fprintf(stderr,
+            "ds4:   gpu time profile %s: decode_tokens=%llu "
+            "command_buffers=%llu gpu_samples=%llu kernel_samples=%llu "
+            "commit_to_start_samples=%llu "
+            "gpu_busy_total=%.3f ms gpu_busy_avg=%.3f ms "
+            "kernel_total=%.3f ms kernel_avg=%.3f ms "
+            "commit_to_start_total=%.3f ms commit_to_start_avg=%.3f ms "
+            "wall=%.3f ms "
+            "gpu_idle_estimate=%.3f ms busy/wall=%.1f%%\n",
+            scope,
+            (unsigned long long)decode_tokens,
+            (unsigned long long)stats.command_buffers,
+            (unsigned long long)stats.gpu_time_samples,
+            (unsigned long long)stats.kernel_time_samples,
+            (unsigned long long)stats.commit_to_start_samples,
+            stats.gpu_busy_seconds * 1.0e3,
+            gpu_avg_ms,
+            stats.kernel_seconds * 1.0e3,
+            kernel_avg_ms,
+            stats.commit_to_start_seconds * 1.0e3,
+            commit_avg_ms,
+            wall_seconds * 1.0e3,
+            idle_seconds * 1.0e3,
+            busy_percent);
+}
+
+static void ds4_gpu_time_profile_print(void) {
+    if (!g_gpu_time_profile_enabled) return;
+    pthread_mutex_lock(&g_gpu_time_profile_mutex);
+    while (g_gpu_time_profile_outstanding != 0) {
+        pthread_cond_wait(&g_gpu_time_profile_cond,
+                          &g_gpu_time_profile_mutex);
+    }
+    const ds4_gpu_time_profile_stats total = g_gpu_time_profile_total;
+    const ds4_gpu_time_profile_stats decode = g_gpu_time_profile_decode;
+    pthread_mutex_unlock(&g_gpu_time_profile_mutex);
+
+    const double now_seconds = ds4_gpu_time_profile_now_seconds();
+    ds4_gpu_time_profile_print_one("total", total, now_seconds,
+                                   g_stream_expert_cache_decode_tokens);
+    ds4_gpu_time_profile_print_one("decode", decode, now_seconds,
+                                   g_stream_expert_cache_decode_tokens);
+}
+
 /* A failed command buffer can leave a cross-threadgroup arrival counter at an
  * arbitrary partial value.  Drop cached ownership instead of CPU-resetting
  * buffers that another in-flight command buffer might still reference; bound
@@ -1565,7 +1748,7 @@ static int ds4_gpu_finish_command_buffer(id<MTLCommandBuffer> cb, int owned, con
     if (!owned) return 1;
 
     const double t_commit = ds4_gpu_now_ms();
-    [cb commit];
+    ds4_gpu_commit_command_buffer(cb);
     int ok = ds4_gpu_wait_pending_command_buffers(label);
     if (!ds4_gpu_wait_command_buffer(cb, label)) {
         ok = 0;
@@ -2979,7 +3162,7 @@ static int ds4_gpu_warm_model_views(void) {
     }
     ds4_gpu_end_compute_encoder(cb, enc);
 
-    [cb commit];
+    ds4_gpu_commit_command_buffer(cb);
     [cb waitUntilCompleted];
 
     if (cb.status == MTLCommandBufferStatusError) {
@@ -6802,6 +6985,7 @@ typedef struct {
  * while long-context prefill and decode can still pick specialized variants. */
 int ds4_gpu_init(void) {
     if (g_initialized) return 1;
+    ds4_gpu_time_profile_reset();
 
     @autoreleasepool {
         ds4_gpu_decode_pipeline_fast_cache_reset();
@@ -9146,7 +9330,7 @@ int ds4_gpu_test_mxfp4_down_half_lut(uint16_t *legacy_bits,
         [enc dispatchThreadgroups:MTLSizeMake((count + 255u) / 256u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256u, 1, 1)];
         [enc endEncoding];
-        [cb commit];
+        ds4_gpu_commit_command_buffer(cb);
         if (!ds4_gpu_wait_command_buffer(cb, "MXFP4 half-LUT raw-bit test")) {
             return 0;
         }
@@ -9477,7 +9661,7 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
-    [cb commit];
+    ds4_gpu_commit_command_buffer(cb);
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
 
@@ -10103,7 +10287,7 @@ int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *
         id<MTLCommandBuffer> cb = g_batch_cb;
         g_batch_cb = nil;
         g_batch_has_work = NO;
-        [cb commit];
+        ds4_gpu_commit_command_buffer(cb);
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
         const char *what = label ? label : "selected-id overlap";
@@ -10501,7 +10685,7 @@ static void *ds4_gpu_tp_keepalive_thread(void *arg) {
             [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)ka_tgs, 1, 1)
                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
-            [cb commit];
+            ds4_gpu_commit_command_buffer(cb);
             [cb waitUntilCompleted];
         }
     }
@@ -11266,7 +11450,7 @@ int ds4_gpu_warm_command_queue(void) {
         [enc setBytes:&iters length:sizeof(iters) atIndex:1];
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
-        [cb commit];
+        ds4_gpu_commit_command_buffer(cb);
         [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return 0;
     }
@@ -11305,7 +11489,7 @@ static void *ds4_gpu_queue_keepalive_thread(void *arg) {
             [enc setBytes:&iters length:sizeof(iters) atIndex:1];
             [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
-            [cb commit];
+            ds4_gpu_commit_command_buffer(cb);
         }
         for (uint64_t slept = 0; slept < period_ms && !g_queue_keepalive_stop; slept += 50)
             usleep(50000);
@@ -11374,7 +11558,7 @@ static int ds4_gpu_signal_batch_and_wait_event(const char *label) {
         const uint64_t value = ++g_selected_readback_event_value;
         [cb encodeSignalEvent:g_selected_readback_event value:value];
         g_batch_has_work = YES;
-        [cb commit];
+        ds4_gpu_commit_command_buffer(cb);
         ds4_gpu_stream_expert_cache_note_batch_committed();
 
         const BOOL signaled = [g_selected_readback_event waitUntilSignaledValue:value timeoutMS:60000];
@@ -11500,7 +11684,7 @@ void ds4_gpu_cleanup(void) {
         ds4_gpu_parallel_ffn_reset_state(YES);
         if (g_batch_cb) {
             ds4_gpu_close_batch_encoder();
-            [g_batch_cb commit];
+            ds4_gpu_commit_command_buffer(g_batch_cb);
             [g_batch_cb waitUntilCompleted];
             g_batch_cb = nil;
             if (g_stream_expert_cache_batch_seq > g_stream_expert_cache_done_seq) {
@@ -11517,6 +11701,7 @@ void ds4_gpu_cleanup(void) {
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
         ds4_gpu_stream_expert_pread_pool_shutdown();
+        ds4_gpu_time_profile_print();
         ds4_gpu_stream_expert_cache_clear_all(1);
         for (uint32_t layer = 0; layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
             g_stream_expert_cache_gate_addr_buffers[layer] = nil;
@@ -14336,6 +14521,7 @@ static void ds4_gpu_stream_expert_cache_note_frequency_hotness(
 }
 
 static void ds4_gpu_stream_expert_cache_note_token(uint32_t layer_index) {
+    ds4_gpu_time_profile_note_decode_started();
     if (!g_ssd_streaming_mode ||
         g_stream_expert_cache_decode_tokens == UINT64_MAX) {
         return;
@@ -38528,7 +38714,7 @@ int ds4_gpu_glm_routed_moe_one_tensor(
             const int resident_owned = owned;
             if (owned) {
                 resident_cb = cb;
-                [resident_cb commit];
+                ds4_gpu_commit_command_buffer(resident_cb);
                 cb = nil;
             } else {
                 ok = ds4_gpu_flush_commands();
