@@ -2732,6 +2732,26 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         uint32_t                mid_token_stride);
 
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
+int ds4_gpu_routed_moe_set_selected_lookup_override(const int32_t *selected,
+                                                     uint32_t n_selected);
+int ds4_gpu_stream_expert_cache_prepare_verifier_union(
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              layer,
+        const ds4_gpu_tensor *selected,
+        uint32_t              rows,
+        uint32_t              n_total_expert,
+        uint32_t              topk,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              down_expert_bytes,
+        int32_t              *selected_ids,
+        uint32_t              selected_capacity);
+int ds4_gpu_stream_expert_cache_complete_verifier_union(uint32_t layer);
+int ds4_gpu_stream_expert_cache_activate_verifier_union(uint32_t layer);
+void ds4_gpu_stream_expert_cache_finish_verifier_union(void);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);
 #ifdef DS4_ROCM_BUILD
 int ds4_gpu_dspark_gfx1151_fast_path(void);

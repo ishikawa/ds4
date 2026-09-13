@@ -781,6 +781,11 @@ static uint64_t g_stream_expert_timing_cache_all_missing_layers;
 static uint64_t g_stream_expert_timing_cache_mixed_layers;
 static uint64_t g_stream_expert_timing_cache_resident_experts;
 static uint64_t g_stream_expert_timing_cache_missing_experts;
+static uint64_t g_stream_expert_timing_union_calls;
+static uint64_t g_stream_expert_timing_union_experts;
+static uint64_t g_stream_expert_timing_union_unique_misses;
+static double g_stream_expert_timing_union_pin_wait_ms;
+static double g_stream_expert_timing_union_pread_ms;
 typedef struct {
     uint64_t selected_calls;
     double selected_read_ms;
@@ -826,6 +831,11 @@ typedef struct {
     uint64_t cache_mixed_layers;
     uint64_t cache_resident_experts;
     uint64_t cache_missing_experts;
+    uint64_t union_calls;
+    uint64_t union_experts;
+    uint64_t union_unique_misses;
+    double union_pin_wait_ms;
+    double union_pread_ms;
 } ds4_gpu_stream_expert_timing_snapshot;
 static ds4_gpu_stream_expert_timing_snapshot g_stream_expert_timing_last_report;
 static int g_stream_prefill_batch_selected_addr_building;
@@ -915,6 +925,7 @@ static int g_mpp_invalid_env_reported;
 #define DS4_METAL_MAX_ROUTED_EXPERT_USED 8
 static int32_t g_routed_moe_selected_override[DS4_METAL_MAX_ROUTED_EXPERT_USED];
 static uint32_t g_routed_moe_selected_override_n;
+static int g_routed_moe_selected_override_lookup_only;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
 static uint64_t g_moe_selected_trace_record_count;
@@ -962,7 +973,9 @@ static uint32_t g_model_view_count;
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
-    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
+    /* A k=2 verifier prepares the union of two ordinary top-k=6 rows. */
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED =
+        2 * DS4_METAL_MAX_ROUTED_EXPERT_USED,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
@@ -1017,6 +1030,28 @@ typedef struct {
 
 static ds4_gpu_stream_expert_cache_entry
     g_stream_expert_cache[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+typedef struct {
+    int active;
+    uint32_t layer;
+    uint32_t resource_count;
+    uint32_t unique_count;
+    uint32_t unique_misses;
+    int32_t unique_ids[2u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
+    const void *model_map;
+    uint64_t model_size;
+    uint32_t n_total_expert;
+    uint32_t topk;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    ds4_gpu_stream_expert_cache_entry
+        *resources[2u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
+} ds4_gpu_stream_verifier_union;
+static ds4_gpu_stream_verifier_union g_stream_verifier_union;
+static int g_stream_verifier_union_collect_pin_wait;
+static double g_stream_verifier_union_pin_wait_ms;
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -4174,6 +4209,11 @@ ds4_gpu_stream_expert_timing_current(void) {
             g_stream_expert_timing_cache_resident_experts,
         .cache_missing_experts =
             g_stream_expert_timing_cache_missing_experts,
+        .union_calls = g_stream_expert_timing_union_calls,
+        .union_experts = g_stream_expert_timing_union_experts,
+        .union_unique_misses = g_stream_expert_timing_union_unique_misses,
+        .union_pin_wait_ms = g_stream_expert_timing_union_pin_wait_ms,
+        .union_pread_ms = g_stream_expert_timing_union_pread_ms,
     };
 }
 
@@ -4349,6 +4389,18 @@ ds4_gpu_stream_expert_timing_delta(
             ds4_gpu_stream_expert_timing_delta_u64(
                     current.cache_missing_experts,
                     previous.cache_missing_experts),
+        .union_calls = ds4_gpu_stream_expert_timing_delta_u64(
+                    current.union_calls, previous.union_calls),
+        .union_experts = ds4_gpu_stream_expert_timing_delta_u64(
+                    current.union_experts, previous.union_experts),
+        .union_unique_misses = ds4_gpu_stream_expert_timing_delta_u64(
+                    current.union_unique_misses,
+                    previous.union_unique_misses),
+        .union_pin_wait_ms = ds4_gpu_stream_expert_timing_delta_f64(
+                    current.union_pin_wait_ms,
+                    previous.union_pin_wait_ms),
+        .union_pread_ms = ds4_gpu_stream_expert_timing_delta_f64(
+                    current.union_pread_ms, previous.union_pread_ms),
     };
 }
 
@@ -4359,7 +4411,8 @@ static int ds4_gpu_stream_expert_timing_has_data(
            s.load_calls != 0 ||
            s.cache_all_resident_layers != 0 ||
            s.cache_all_missing_layers != 0 ||
-           s.cache_mixed_layers != 0;
+           s.cache_mixed_layers != 0 ||
+           s.union_calls != 0;
 }
 
 static void ds4_gpu_stream_expert_timing_print(
@@ -4525,6 +4578,22 @@ static void ds4_gpu_stream_expert_timing_print(
                 s.cpu_lookup_ms,
                 s.cpu_prepare_ms,
                 s.cpu_encode_submit_ms);
+    }
+    if (s.union_calls != 0) {
+        const double calls = (double)s.union_calls;
+        fprintf(stderr,
+                "ds4:   streaming expert verifier union %s calls=%llu "
+                "union_experts_avg=%.2f unique_misses_avg=%.2f "
+                "pin_wait_avg=%.3f ms pread_avg=%.3f ms "
+                "pin_wait_total=%.3f ms pread_total=%.3f ms\n",
+                scope ? scope : "total",
+                (unsigned long long)s.union_calls,
+                (double)s.union_experts / calls,
+                (double)s.union_unique_misses / calls,
+                s.union_pin_wait_ms / calls,
+                s.union_pread_ms / calls,
+                s.union_pin_wait_ms,
+                s.union_pread_ms);
     }
 }
 
@@ -13619,6 +13688,7 @@ typedef struct {
 } ds4_gpu_stream_expert_pending_load;
 
 static ds4_gpu_stream_expert_pending_load g_stream_expert_pending_load;
+static double g_stream_expert_pending_last_elapsed_ms;
 
 typedef struct {
     int active;
@@ -15780,8 +15850,15 @@ retry:
         if (skipped_inflight && !waited_inflight &&
             !ds4_gpu_stream_expert_cache_on_service_thread()) {
             waited_inflight = 1;
-            if (!ds4_gpu_stream_expert_cache_wait_inflight(
-                    "streaming expert cache reuse")) {
+            const double wait_t0 = g_stream_verifier_union_collect_pin_wait ?
+                                   ds4_gpu_now_ms() : 0.0;
+            const int wait_ok = ds4_gpu_stream_expert_cache_wait_inflight(
+                    "streaming expert cache reuse");
+            if (wait_t0 != 0.0) {
+                g_stream_verifier_union_pin_wait_ms +=
+                    ds4_gpu_now_ms() - wait_t0;
+            }
+            if (!wait_ok) {
                 return 0;
             }
             goto retry;
@@ -16762,6 +16839,7 @@ static int ds4_gpu_stream_expert_pending_load_finish(
         return 0;
     }
     const double elapsed_ms = ds4_gpu_now_ms() - start_ms;
+    g_stream_expert_pending_last_elapsed_ms = elapsed_ms;
     p->active = 0;
     const int ok = ds4_gpu_stream_expert_pending_load_install(p,
                                                               entries,
@@ -17703,10 +17781,16 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         uint32_t      *unique_out,
         id<MTLBuffer> *overflow_gate,
         id<MTLBuffer> *overflow_up,
-        id<MTLBuffer> *overflow_down) {
+        id<MTLBuffer> *overflow_down,
+        int32_t       *selected_ids_out,
+        uint32_t       selected_ids_capacity,
+        uint32_t      *misses_out,
+        double        *pread_ms_out) {
     if (overflow_gate) *overflow_gate = nil;
     if (overflow_up) *overflow_up = nil;
     if (overflow_down) *overflow_down = nil;
+    if (misses_out) *misses_out = 0;
+    if (pread_ms_out) *pread_ms_out = 0.0;
     if (!g_ssd_streaming_mode ||
         !model_map ||
         !selected ||
@@ -17754,6 +17838,13 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     if (ok) {
         if (!ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) {
             ok = 0;
+        }
+    }
+    if (ok && selected_ids_out) {
+        if (n_ids > selected_ids_capacity) {
+            ok = 0;
+        } else {
+            memcpy(selected_ids_out, ids, (size_t)n_ids * sizeof(ids[0]));
         }
     }
     if (ok) {
@@ -17963,6 +18054,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                                                n_tasks,
                                                &read_bytes,
                                                &read_ms);
+        if (pread_ms_out) *pread_ms_out = read_ms;
         if (ok) {
             ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
         }
@@ -18113,6 +18205,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         return 0;
     }
     *unique_out = *n_resources + view_served;
+    if (misses_out) *misses_out = n_loads;
     if (view_served != 0 &&
         ds4_gpu_stream_expert_timing_summary_enabled()) {
         fprintf(stderr,
@@ -18145,6 +18238,156 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 ds4_gpu_gib(logical_bytes));
     }
     return 1;
+}
+
+void ds4_gpu_stream_expert_cache_finish_verifier_union(void) {
+    if (g_stream_verifier_union.active &&
+        g_stream_expert_pending_load.active) {
+        ds4_gpu_stream_expert_pending_load_clear();
+    }
+    memset(g_stream_verifier_union.resources, 0,
+           sizeof(g_stream_verifier_union.resources));
+    g_stream_verifier_union.active = 0;
+    g_stream_verifier_union.layer = 0;
+    g_stream_verifier_union.resource_count = 0;
+    g_stream_verifier_union.unique_count = 0;
+    g_stream_verifier_union.unique_misses = 0;
+}
+
+int ds4_gpu_stream_expert_cache_prepare_verifier_union(
+        const void           *model_map,
+        uint64_t              model_size,
+        uint32_t              layer,
+        const ds4_gpu_tensor *selected,
+        uint32_t              rows,
+        uint32_t              n_total_expert,
+        uint32_t              topk,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              down_expert_bytes,
+        int32_t              *selected_ids,
+        uint32_t              selected_capacity) {
+    if (!selected_ids || rows == 0 || topk == 0 ||
+        rows > 2u || topk > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        rows * topk > selected_capacity ||
+        rows * topk > 2u * DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
+
+    ds4_gpu_stream_expert_cache_finish_verifier_union();
+    const uint32_t n_ids = rows * topk;
+    if (!ds4_gpu_tensor_read(selected, 0, selected_ids,
+                             (uint64_t)n_ids * sizeof(selected_ids[0]))) {
+        return 0;
+    }
+    bool seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
+    for (uint32_t i = 0; i < n_ids; i++) {
+        const int32_t id = selected_ids[i];
+        if (id < 0 || (uint32_t)id >= n_total_expert) return 0;
+        if (!seen[(uint32_t)id]) {
+            seen[(uint32_t)id] = true;
+            g_stream_verifier_union.unique_ids[
+                g_stream_verifier_union.unique_count++] = id;
+        }
+    }
+    g_stream_verifier_union.model_map = model_map;
+    g_stream_verifier_union.model_size = model_size;
+    g_stream_verifier_union.layer = layer;
+    g_stream_verifier_union.n_total_expert = n_total_expert;
+    g_stream_verifier_union.topk = topk;
+    g_stream_verifier_union.gate_offset = gate_offset;
+    g_stream_verifier_union.up_offset = up_offset;
+    g_stream_verifier_union.down_offset = down_offset;
+    g_stream_verifier_union.gate_expert_bytes = gate_expert_bytes;
+    g_stream_verifier_union.down_expert_bytes = down_expert_bytes;
+    for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
+        const uint64_t id = (uint32_t)g_stream_verifier_union.unique_ids[u];
+        const uint64_t gate_abs = gate_offset + id * gate_expert_bytes;
+        const uint64_t down_abs = down_offset + id * down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][id];
+        if (!ds4_gpu_stream_expert_cache_entry_matches(
+                e, model_map, model_size, gate_abs,
+                up_offset + id * gate_expert_bytes, down_abs,
+                gate_expert_bytes, down_expert_bytes)) {
+            g_stream_verifier_union.unique_misses++;
+        }
+    }
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model_map,
+        .model_size = model_size,
+        .layer = layer,
+        .n_total_expert = n_total_expert,
+        .gate_offset = gate_offset,
+        .up_offset = up_offset,
+        .down_offset = down_offset,
+        .gate_expert_bytes = gate_expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+    };
+    g_stream_verifier_union_pin_wait_ms = 0.0;
+    g_stream_verifier_union_collect_pin_wait = 1;
+    g_stream_expert_pending_last_elapsed_ms = 0.0;
+    const int ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+        &table, g_stream_verifier_union.unique_ids,
+        g_stream_verifier_union.unique_count);
+    g_stream_verifier_union_collect_pin_wait = 0;
+    if (!ok) {
+        ds4_gpu_stream_expert_cache_finish_verifier_union();
+        return 0;
+    }
+    g_stream_verifier_union.active = 1;
+    g_stream_expert_timing_union_calls++;
+    g_stream_expert_timing_union_experts +=
+        g_stream_verifier_union.unique_count;
+    g_stream_expert_timing_union_unique_misses +=
+        g_stream_verifier_union.unique_misses;
+    g_stream_expert_timing_union_pin_wait_ms +=
+        g_stream_verifier_union_pin_wait_ms;
+    return 1;
+}
+
+int ds4_gpu_stream_expert_cache_complete_verifier_union(uint32_t layer) {
+    if (!g_stream_verifier_union.active ||
+        g_stream_verifier_union.layer != layer) return 0;
+    if (!ds4_gpu_stream_expert_pending_load_finish(NULL) ||
+        !ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) return 0;
+    g_stream_expert_timing_union_pread_ms +=
+        g_stream_expert_pending_last_elapsed_ms;
+    g_stream_verifier_union.resource_count = 0;
+    for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
+        const uint32_t id =
+            (uint32_t)g_stream_verifier_union.unique_ids[u];
+        const uint64_t gate_abs = g_stream_verifier_union.gate_offset +
+            (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+        const uint64_t up_abs = g_stream_verifier_union.up_offset +
+            (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+        const uint64_t down_abs = g_stream_verifier_union.down_offset +
+            (uint64_t)id * g_stream_verifier_union.down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *entry =
+            ds4_gpu_stream_expert_cache_peek(
+                g_stream_verifier_union.model_map,
+                g_stream_verifier_union.model_size, layer, id,
+                g_stream_verifier_union.n_total_expert,
+                g_stream_verifier_union.topk, gate_abs, up_abs, down_abs,
+                g_stream_verifier_union.gate_expert_bytes,
+                g_stream_verifier_union.down_expert_bytes);
+        if (!entry || !ds4_gpu_stream_expert_cache_set_addr_slot_raw(
+                layer, id, entry->gate_buffer, entry->gate_inner,
+                entry->up_buffer, entry->up_inner,
+                entry->down_buffer, entry->down_inner)) return 0;
+        g_stream_verifier_union.resources[
+            g_stream_verifier_union.resource_count++] = entry;
+    }
+    return 1;
+}
+
+int ds4_gpu_stream_expert_cache_activate_verifier_union(uint32_t layer) {
+    if (!g_stream_verifier_union.active ||
+        g_stream_verifier_union.layer != layer) return 0;
+    if (g_stream_verifier_union.resource_count == 0) return 1;
+    return ds4_gpu_stream_expert_cache_mark_entries_inflight(
+        g_stream_verifier_union.resources,
+        g_stream_verifier_union.resource_count, 0);
 }
 
 int ds4_gpu_stream_expert_cache_seed_selected(
@@ -39953,7 +40196,8 @@ static int ds4_gpu_glm_routed_moe_batch_tensor_impl(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        NULL, 0, NULL, NULL)) {
                 return 0;
             }
             if (stream_unique == 0) {
@@ -40602,6 +40846,14 @@ int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n
         g_routed_moe_selected_override[i] = selected[i];
     }
     g_routed_moe_selected_override_n = n_selected;
+    g_routed_moe_selected_override_lookup_only = 0;
+    return 1;
+}
+
+int ds4_gpu_routed_moe_set_selected_lookup_override(const int32_t *selected,
+                                                     uint32_t n_selected) {
+    if (!ds4_gpu_routed_moe_set_selected_override(selected, n_selected)) return 0;
+    g_routed_moe_selected_override_lookup_only = 1;
     return 1;
 }
 
@@ -41742,12 +41994,15 @@ int ds4_gpu_routed_moe_one_tensor(
                     selected_exec_ids_from_host = true;
                     g_routed_moe_selected_override_n = 0;
                 } else if (g_routed_moe_selected_override_n == n_expert) {
+                    const int lookup_only =
+                        g_routed_moe_selected_override_lookup_only;
                     memcpy(selected_ids,
                            g_routed_moe_selected_override,
                            (size_t)n_expert * sizeof(selected_ids[0]));
                     selected_id_source = "override";
-                    selected_exec_ids_from_host = true;
+                    selected_exec_ids_from_host = !lookup_only;
                     g_routed_moe_selected_override_n = 0;
+                    g_routed_moe_selected_override_lookup_only = 0;
                 } else if (use_stream_expert_cache &&
                            ds4_gpu_glm_stream_selected_prefetch_take(
                                model_map, model_size, layer_index,
@@ -43981,7 +44236,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                         &stream_unique,
                         &stream_overflow_gate,
                         &stream_overflow_up,
-                        &stream_overflow_down)) {
+                        &stream_overflow_down,
+                        NULL, 0, NULL, NULL)) {
                 g_stream_prefill_batch_selected_addr_building--;
                 return 0;
             }

@@ -40556,21 +40556,21 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
-static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
-                     const ds4_layer_weights *l, uint32_t il, uint32_t token) {
-    uint64_t gate_row = 0, down_row = 0;
-    if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
-        !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
-    const bool shared_owner = g->tp_world == 2 &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
-    ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
+static bool ds41_moe_route(ds41_gpu_graph *g, const ds4_model *m,
+                           const ds4_layer_weights *l, uint32_t token) {
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
-    if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
-        !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
+    return ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) &&
+        ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
-            g->route_logits)) return false;
+            g->route_logits) != 0;
+}
+
+static bool ds41_moe_shared(ds41_gpu_graph *g, const ds4_model *m,
+                            const ds4_layer_weights *l, uint32_t il) {
+    const bool shared_owner = g->tp_world == 2 &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
     if (!shared_owner || g->tp_rank == (il & 1u)) {
         const bool fused_swiglu = ds41_fuse_small();
         if (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, !fused_swiglu) ||
@@ -40584,6 +40584,17 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid,
                          shared_owner || !ds41_fuse_small())) return false;
     }
+    return true;
+}
+
+static bool ds41_moe_routed(ds41_gpu_graph *g, const ds4_model *m,
+                            const ds4_layer_weights *l, uint32_t il) {
+    uint64_t gate_row = 0, down_row = 0;
+    if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
+        !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
+    const bool shared_owner = g->tp_world == 2 &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER");
+    ds4_gpu_tensor *routed = shared_owner ? g->block : g->routed;
     if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
@@ -40601,6 +40612,18 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     }
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
            ds41_bf16(g->block, DS4_N_EMBD);
+}
+
+static bool ds41_moe_after_route(ds41_gpu_graph *g, const ds4_model *m,
+                                 const ds4_layer_weights *l, uint32_t il) {
+    return ds41_moe_shared(g, m, l, il) &&
+           ds41_moe_routed(g, m, l, il);
+}
+
+static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
+                     const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+    return ds41_moe_route(g, m, l, token) &&
+           ds41_moe_after_route(g, m, l, il);
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
@@ -42026,6 +42049,10 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
         !row_logits[0] || !row_logits[1] || !g->dspark ||
         !ds41_spec_frontier_snapshot(frontier, g)) return false;
     const uint32_t start = g->pos;
+    const char *disable_union_env =
+        getenv("DS4_METAL_DISABLE_V41_VERIFY_UNION");
+    const bool disable_union = disable_union_env &&
+        !strcmp(disable_union_env, "1");
     if (start == 0 || ds41_image_at(g, start) || ds41_image_at(g, start + 1u) ||
         !metal_graph_dspark_capture_verified_suffix_begin(
             g->dspark, start, DS41_SPEC_ROWS, false)) return false;
@@ -42055,6 +42082,44 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (!g->streaming || disable_union) {
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+                ds41_gpu_graph view = *g;
+                view.pos = start + row;
+#define DS41_SPEC_LEGACY_ROW(name, width) view.name = g->rows_view[row].name;
+                DS41_PREFILL_ROWS(DS41_SPEC_LEGACY_ROW)
+#undef DS41_SPEC_LEGACY_ROW
+                if (ds41_engram_layer(il)) {
+                    const uint32_t table = il == 1u ? 0u : 1u;
+                    ok = ds4_gpu_tensor_write(view.engram_rows, 0,
+                                               engram[row][table],
+                                               sizeof(engram[row][table]));
+                }
+                if (ok) {
+                    const int slot = metal_graph_dspark_target_slot(g->dspark, il);
+                    if (slot >= 0) ok = ds41_spec_capture_row(
+                        g->dspark, view.residual, (uint32_t)slot, row, start);
+                }
+                if (ok) ok = ds41_graph_layer(&view, m, &w->layer[il], il,
+                                               tokens[row]);
+                if (ok && row == 0 && ds41_kv_source(il)) {
+                    const uint32_t owner = ds41_owner_for_layer(il);
+                    const uint64_t row_bytes = 512u * sizeof(float);
+                    ok = ds4_gpu_tensor_copy(g->spec_state_prefix1,
+                        (uint64_t)(owner * 2u) * row_bytes,
+                        g->previous_kv[owner], 0, row_bytes) != 0 &&
+                         ds4_gpu_tensor_copy(g->spec_state_prefix1,
+                        (uint64_t)(owner * 2u + 1u) * row_bytes,
+                        g->previous_score[owner], 0, row_bytes) != 0;
+                }
+            }
+            if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+            if (!ok) fprintf(stderr,
+                "ds4: V4.1 speculative verifier failed at layer %u pos=%u\n",
+                il, start);
+            continue;
+        }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
             ds41_gpu_graph view = *g;
@@ -42073,8 +42138,9 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
                 if (slot >= 0) ok = ds41_spec_capture_row(
                     g->dspark, view.residual, (uint32_t)slot, row, start);
             }
-            if (ok) ok = ds41_graph_layer(&view, m, &w->layer[il], il,
-                                           tokens[row]);
+            if (ok) ok = ds41_graph_before_moe(&view, m, &w->layer[il], il) &&
+                         ds41_moe_route(&view, m, &w->layer[il],
+                                        (uint32_t)tokens[row]);
             if (ok && row == 0 && ds41_kv_source(il)) {
                 const uint32_t owner = ds41_owner_for_layer(il);
                 const uint64_t row_bytes = 512u * sizeof(float);
@@ -42087,6 +42153,61 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
             }
         }
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        int32_t selected_ids[DS41_SPEC_ROWS * DS4_N_EXPERT_USED];
+        bool union_active = false;
+        if (ok) {
+            uint64_t gate_row = 0, down_row = 0;
+            ok = tensor_nbytes(w->layer[il].ffn_gate_exps->type,
+                               DS4_N_EMBD, &gate_row) &&
+                 tensor_nbytes(w->layer[il].ffn_down_exps->type,
+                               DS4_N_FF_EXP, &down_row) &&
+                 ds4_gpu_stream_expert_cache_prepare_verifier_union(
+                     m->map, m->size, il, g->batch.selected,
+                     DS41_SPEC_ROWS, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                     w->layer[il].ffn_gate_exps->abs_offset,
+                     w->layer[il].ffn_up_exps->abs_offset,
+                     w->layer[il].ffn_down_exps->abs_offset,
+                     gate_row * DS4_N_FF_EXP,
+                     down_row * DS4_N_EMBD,
+                     selected_ids,
+                     DS41_SPEC_ROWS * DS4_N_EXPERT_USED) != 0;
+            union_active = ok;
+        }
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        if (ok && union_active) {
+            /* Submit both shared experts while the union pread worker owns the
+             * missing expert I/O.  Routed kernels remain row-wise and start
+             * only after every union address is installed. */
+            for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+                ds41_gpu_graph view = *g;
+                view.pos = start + row;
+#define DS41_SPEC_SHARED_ROW(name, width) view.name = g->rows_view[row].name;
+                DS41_PREFILL_ROWS(DS41_SPEC_SHARED_ROW)
+#undef DS41_SPEC_SHARED_ROW
+                ok = ds41_moe_shared(&view, m, &w->layer[il], il);
+            }
+            if (ok) ok = ds4_gpu_flush_commands() != 0;
+            if (ok) ok =
+                ds4_gpu_stream_expert_cache_complete_verifier_union(il) != 0 &&
+                ds4_gpu_stream_expert_cache_activate_verifier_union(il) != 0;
+        }
+        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+            ds41_gpu_graph view = *g;
+            view.pos = start + row;
+#define DS41_SPEC_FINISH_ROW(name, width) view.name = g->rows_view[row].name;
+            DS41_PREFILL_ROWS(DS41_SPEC_FINISH_ROW)
+#undef DS41_SPEC_FINISH_ROW
+            if (union_active)
+                ok = ds4_gpu_routed_moe_set_selected_lookup_override(
+                    &selected_ids[row * DS4_N_EXPERT_USED],
+                    DS4_N_EXPERT_USED) != 0;
+            if (ok) ok = (union_active ?
+                          ds41_moe_routed(&view, m, &w->layer[il], il) :
+                          ds41_moe_after_route(&view, m, &w->layer[il], il)) &&
+                         ds41_graph_after_moe(&view);
+        }
+        if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+        if (union_active) ds4_gpu_stream_expert_cache_finish_verifier_union();
         if (!ok) fprintf(stderr,
             "ds4: V4.1 speculative verifier failed at layer %u pos=%u\n",
             il, start);
