@@ -776,6 +776,14 @@ static double g_v41_handshake_timing_pread_ms;
 static double g_v41_handshake_timing_publish_ms;
 static double g_v41_handshake_timing_signal_ms;
 static double g_v41_handshake_timing_gpu_wait_upper_ms;
+static uint64_t g_v41_handshake_queue_depth_samples;
+static uint64_t g_v41_handshake_queue_depth_sum;
+static uint32_t g_v41_handshake_queue_depth_max;
+static uint64_t g_v41_one_cb_tokens;
+static uint64_t g_v41_one_cb_command_buffers;
+static uint32_t g_v41_one_cb_command_buffers_current;
+static uint32_t g_v41_one_cb_command_buffers_max;
+static int g_v41_one_cb_token_active;
 static uint64_t g_stream_expert_timing_load_calls;
 static double g_stream_expert_timing_load_prepare_ms;
 static double g_stream_expert_timing_load_pread_ms;
@@ -4692,6 +4700,22 @@ static void ds4_gpu_stream_expert_timing_print(
                 g_v41_handshake_timing_publish_ms / calls,
                 g_v41_handshake_timing_signal_ms / calls,
                 g_v41_handshake_timing_gpu_wait_upper_ms / calls);
+        const double queue_samples =
+            (double)g_v41_handshake_queue_depth_samples;
+        const double cb_tokens = (double)g_v41_one_cb_tokens;
+        fprintf(stderr,
+                "ds4:   V4.1 one-CB tokens=%llu command_buffers=%llu "
+                "cb_per_token_avg=%.3f cb_per_token_max=%u "
+                "service_queue_depth_avg=%.2f service_queue_depth_max=%u\n",
+                (unsigned long long)g_v41_one_cb_tokens,
+                (unsigned long long)g_v41_one_cb_command_buffers,
+                cb_tokens ?
+                    (double)g_v41_one_cb_command_buffers / cb_tokens : 0.0,
+                g_v41_one_cb_command_buffers_max,
+                queue_samples ?
+                    (double)g_v41_handshake_queue_depth_sum / queue_samples :
+                    0.0,
+                g_v41_handshake_queue_depth_max);
     }
     if (s.cpu_gap_calls != 0) {
         fprintf(stderr,
@@ -12014,6 +12038,8 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
+    if (g_v41_one_cb_token_active)
+        g_v41_one_cb_command_buffers_current++;
     ds4_gpu_stream_expert_timing_note_next_commit();
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
 }
@@ -15117,6 +15143,46 @@ static int ds4_gpu_v41_event_handshake_requested(void) {
     return 1;
 }
 
+int ds4_gpu_v41_one_cb_enabled(void) {
+    const char *value = getenv("DS4_METAL_V41_ONE_CB");
+    if (!g_ssd_streaming_mode || !value || strcmp(value, "1") != 0) return 0;
+    if (!ds4_gpu_v41_addr_table_requested() ||
+        !ds4_gpu_v41_event_handshake_requested()) {
+        static int warned;
+        if (!warned) {
+            warned = 1;
+            fprintf(stderr,
+                    "ds4: warning: DS4_METAL_V41_ONE_CB=1 requires "
+                    "DS4_METAL_V41_EVENT_HANDSHAKE=1 and "
+                    "DS4_METAL_V41_ADDR_TABLE=1; one-CB decode disabled\n");
+        }
+        return 0;
+    }
+    static int logged;
+    if (!logged) {
+        logged = 1;
+        fprintf(stderr, "ds4: V4.1 one command buffer per token enabled\n");
+    }
+    return 1;
+}
+
+void ds4_gpu_v41_one_cb_token_begin(void) {
+    g_v41_one_cb_command_buffers_current = 0;
+    g_v41_one_cb_token_active = 1;
+}
+
+void ds4_gpu_v41_one_cb_token_end(void) {
+    if (!g_v41_one_cb_token_active) return;
+    g_v41_one_cb_tokens++;
+    g_v41_one_cb_command_buffers += g_v41_one_cb_command_buffers_current;
+    if (g_v41_one_cb_command_buffers_current >
+        g_v41_one_cb_command_buffers_max) {
+        g_v41_one_cb_command_buffers_max =
+            g_v41_one_cb_command_buffers_current;
+    }
+    g_v41_one_cb_token_active = 0;
+}
+
 static int ds4_gpu_stream_expert_hit_validator_requested(void) {
     return g_ssd_streaming_mode &&
            getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR") != NULL &&
@@ -18035,6 +18101,8 @@ static pthread_t g_v41_handshake_thread;
 static int g_v41_handshake_thread_running;
 static int g_v41_handshake_shutdown;
 static int g_v41_handshake_fail_injected;
+static uint64_t g_v41_handshake_active_cb_seq;
+static uint64_t g_v41_handshake_cancelled_through_seq;
 
 static int ds4_gpu_v41_handshake_publish(
         const ds4_gpu_v41_handshake_request *req,
@@ -18125,6 +18193,8 @@ static void *ds4_gpu_v41_handshake_service_main(void *unused) {
         g_v41_handshake_queue_head =
             (g_v41_handshake_queue_head + 1u) % DS4_V41_HANDSHAKE_QUEUE;
         g_v41_handshake_queue_count--;
+        __atomic_store_n(&g_v41_handshake_active_cb_seq, req.cb_seq,
+                         __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_v41_handshake_mutex);
 
         const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
@@ -18135,10 +18205,23 @@ static void *ds4_gpu_v41_handshake_service_main(void *unused) {
                 waitUntilSignaledValue:req.ready_value timeoutMS:100];
         }
         double ready_ms = timing ? ds4_gpu_now_ms() : 0.0;
-        if (timing) g_v41_handshake_timing_wake_ms += ready_ms - stage_t0;
+        if (timing) {
+            g_v41_handshake_timing_wake_ms += ready_ms - stage_t0;
+            pthread_mutex_lock(&g_v41_handshake_mutex);
+            const uint32_t depth = g_v41_handshake_queue_count + 1u;
+            g_v41_handshake_queue_depth_samples++;
+            g_v41_handshake_queue_depth_sum += depth;
+            if (depth > g_v41_handshake_queue_depth_max)
+                g_v41_handshake_queue_depth_max = depth;
+            pthread_mutex_unlock(&g_v41_handshake_mutex);
+        }
 
-        int ok = ready && !ds4_gpu_v41_handshake_fail_inject(req.layer);
-        const char *failed_stage = ready ? "injected" : "ready-wait";
+        const int cancelled = req.cb_seq <= __atomic_load_n(
+            &g_v41_handshake_cancelled_through_seq, __ATOMIC_ACQUIRE);
+        int ok = ready && !cancelled &&
+                 !ds4_gpu_v41_handshake_fail_inject(req.layer);
+        const char *failed_stage = !ready ? "ready-wait" :
+                                   cancelled ? "cancelled" : "injected";
         int32_t selected_ids[6] = {0};
         ds4_gpu_stream_expert_cache_entry *entries[6] = {NULL};
         uint64_t gate_abs[6] = {0}, up_abs[6] = {0}, down_abs[6] = {0};
@@ -18230,6 +18313,8 @@ static void *ds4_gpu_v41_handshake_service_main(void *unused) {
             g_v41_handshake_timing_gpu_wait_upper_ms += signaled_ms - ready_ms;
             g_v41_handshake_timing_calls++;
         }
+        __atomic_store_n(&g_v41_handshake_active_cb_seq, 0,
+                         __ATOMIC_RELEASE);
     }
     return NULL;
 }
@@ -18367,6 +18452,30 @@ static void ds4_gpu_v41_event_handshake_force_release(const char *reason) {
     if (!g_v41_handshake_thread_running) return;
     fprintf(stderr, "ds4: forcing V4.1 loaded events (%s)\n",
             reason ? reason : "error");
+    uint64_t cancel_through = __atomic_load_n(
+        &g_v41_handshake_active_cb_seq, __ATOMIC_ACQUIRE);
+    pthread_mutex_lock(&g_v41_handshake_mutex);
+    for (uint32_t i = 0; i < g_v41_handshake_queue_count; i++) {
+        const uint32_t at = (g_v41_handshake_queue_head + i) %
+                            DS4_V41_HANDSHAKE_QUEUE;
+        if (g_v41_handshake_queue[at].cb_seq > cancel_through)
+            cancel_through = g_v41_handshake_queue[at].cb_seq;
+        g_v41_handshake_queue[at] = (ds4_gpu_v41_handshake_request){0};
+    }
+    g_v41_handshake_queue_head = 0;
+    g_v41_handshake_queue_count = 0;
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        g_v41_handshake_pending[layer] =
+            (ds4_gpu_v41_handshake_pending){0};
+    }
+    pthread_mutex_unlock(&g_v41_handshake_mutex);
+    uint64_t old_cancel = __atomic_load_n(
+        &g_v41_handshake_cancelled_through_seq, __ATOMIC_RELAXED);
+    while (cancel_through > old_cancel &&
+           !__atomic_compare_exchange_n(
+               &g_v41_handshake_cancelled_through_seq, &old_cancel,
+               cancel_through, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {}
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
         const uint64_t value = g_v41_handshake_loaded_targets[layer];
@@ -18389,6 +18498,8 @@ static void ds4_gpu_v41_handshake_stop_service(void) {
     g_v41_handshake_queue_count = 0;
     g_v41_handshake_shutdown = 0;
     g_v41_handshake_fail_injected = 0;
+    g_v41_handshake_active_cb_seq = 0;
+    g_v41_handshake_cancelled_through_seq = 0;
 }
 
 static void ds4_gpu_glm_stream_selected_prefetch_set(

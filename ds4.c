@@ -40655,6 +40655,20 @@ static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
 }
 
+static bool ds41_graph_logits_encode(ds41_gpu_graph *g, const ds4_model *m,
+                                     const ds4_weights *w) {
+    const ds4_gpu_tensor *pre = ds41_fuse_small() ? g->ffn_split : g->pre;
+    return (ds41_fuse_small() ?
+        ds4_gpu_dsv41_hc_weighted_sum_norm_bf16(g->x, g->norm,
+            g->residual, pre, m->map, m->size, w->output_norm->abs_offset,
+            DS4_N_EMBD, DS4_RMS_EPS) != 0 :
+        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre,
+            DS4_N_EMBD, DS4_N_HC) &&
+            ds41_bf16(g->x, DS4_N_EMBD) &&
+            ds41_norm(g->norm, g->x, m, w->output_norm)) &&
+        ds41_matmul(g->logits, m, w->output, g->norm, false);
+}
+
 static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                                        const ds4_layer_weights *l, uint32_t il) {
     if (ds41_engram_layer(il) && !ds41_image_at(g, g->pos)) {
@@ -41055,21 +41069,50 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     for (uint32_t i = 0; !ds41_image_at(g, g->pos) && i < 2; i++) {
         if (!ds4_engram_read(&g->table[i], ids[i], DS4_ENGRAM_COLS, g->rows[i])) return false;
     }
+    const bool layer_resident = g->streaming && g->quality;
+    const bool one_cb = g->streaming && !layer_resident &&
+        g->tp_world == 1 && !g->imatrix &&
+        ds4_gpu_v41_one_cb_enabled();
+    ds4_gpu_tensor *engram_rows_base = g->engram_rows;
+    ds4_gpu_tensor *one_cb_engram[2] = {NULL, NULL};
+    const uint64_t engram_bytes = sizeof(g->rows[0]);
+    if (one_cb && !ds41_image_at(g, g->pos)) {
+        for (uint32_t i = 0; i < 2; i++) {
+            one_cb_engram[i] = ds4_gpu_tensor_view(
+                g->engram_prefetch, i * engram_bytes, engram_bytes);
+            if (!one_cb_engram[i] ||
+                !ds4_gpu_tensor_write(one_cb_engram[i], 0, g->rows[i],
+                                      engram_bytes)) {
+                ds4_gpu_tensor_free(one_cb_engram[0]);
+                ds4_gpu_tensor_free(one_cb_engram[1]);
+                return false;
+            }
+        }
+    }
     const uint64_t capture_generation = g->dspark ?
         ++g->dspark_capture_generation : 0;
     if (g->dspark) metal_graph_dspark_capture_begin(g->dspark);
     const float initial_pre[] = {1, 0, 0, 0};
-    if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre)) ||
-        !ds4_gpu_begin_commands()) return false;
+    if (!ds4_gpu_tensor_write(g->pre, 0, initial_pre, sizeof(initial_pre))) {
+        ds4_gpu_tensor_free(one_cb_engram[0]);
+        ds4_gpu_tensor_free(one_cb_engram[1]);
+        return false;
+    }
+    if (one_cb) ds4_gpu_v41_one_cb_token_begin();
+    if (!ds4_gpu_begin_commands()) {
+        if (one_cb) ds4_gpu_v41_one_cb_token_end();
+        ds4_gpu_tensor_free(one_cb_engram[0]);
+        ds4_gpu_tensor_free(one_cb_engram[1]);
+        return false;
+    }
     bool ok = ds41_embed(g, m, w, g->residual, g->x, token, g->pos);
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
-    const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
     const bool defer_layer_end = g->streaming && !layer_resident &&
         g->tp_world == 1 && !g->imatrix &&
         getenv("DS4_METAL_V41_STREAM_DEFER_LAYER_END") != NULL;
-    const bool queue_layers = defer_layer_end ||
+    const bool queue_layers = one_cb || defer_layer_end ||
         (g->tp_world == 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
@@ -41078,7 +41121,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = metal_graph_stream_map_layer(m, w, il) && ds4_gpu_begin_commands();
         if (ok && ds41_engram_layer(il)) {
             const uint32_t i = il == 1 ? 0 : 1;
-            ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
+            if (one_cb) {
+                g->engram_rows = one_cb_engram[i];
+            } else {
+                ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i],
+                                          sizeof(g->rows[i]));
+            }
         }
         if (ok && g->dspark) {
             const int slot = metal_graph_dspark_target_slot(g->dspark, il);
@@ -41098,16 +41146,15 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             }
         }
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
-        /* TP gates already submit ordered, bounded command buffers. The
-         * single-GPU streaming experiment commits the layer tail without
-         * waiting, so the next layer can be encoded while it runs. Drain
-         * before overwriting the first Engram table's shared input at layer
-         * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !ok || !queue_layers || il == 13 ||
-            il + 1u == DS4_N_LAYER;
+        /* TP gates already submit ordered, bounded command buffers. Deferred
+         * streaming commits layer tails without waiting. One-CB decode keeps
+         * both Engram inputs distinct and carries the graph through logits. */
+        const bool drain = !ok || (!one_cb &&
+            (!queue_layers || il == 13 || il + 1u == DS4_N_LAYER));
         if (drain) {
             if (!ds4_gpu_end_commands()) ok = false;
-        } else if (defer_layer_end && !ds4_gpu_flush_commands()) {
+        } else if (!one_cb && defer_layer_end &&
+                   !ds4_gpu_flush_commands()) {
             ok = false;
         }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
@@ -41118,10 +41165,20 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         if (ok && drain && !layer_resident && il + 1u < DS4_N_LAYER)
             ok = ds4_gpu_begin_commands() != 0;
     }
+    if (one_cb && ok && logits) ok = ds41_graph_logits_encode(g, m, w);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (one_cb) ds4_gpu_v41_one_cb_token_end();
+    g->engram_rows = engram_rows_base;
+    ds4_gpu_tensor_free(one_cb_engram[0]);
+    ds4_gpu_tensor_free(one_cb_engram[1]);
     if (layer_resident && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
-    if (ok && logits) ok = ds41_graph_logits(g, m, w, logits);
+    if (ok && logits) {
+        ok = one_cb ?
+            ds4_gpu_tensor_read(g->logits, 0, logits,
+                                (uint64_t)DS4_N_VOCAB * sizeof(float)) :
+            ds41_graph_logits(g, m, w, logits);
+    }
     if (!ok) {
         if (g->dspark) metal_graph_dspark_capture_row_invalidate(g->dspark);
         g->valid = false;

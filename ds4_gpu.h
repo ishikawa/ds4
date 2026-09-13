@@ -2912,6 +2912,11 @@ int ds4_gpu_v41_event_handshake_begin(
         uint32_t              n_selected,
         uint32_t              layer);
 
+/* Decode-only graph batching built on the V4.1 event handshake. */
+int  ds4_gpu_v41_one_cb_enabled(void);
+void ds4_gpu_v41_one_cb_token_begin(void);
+void ds4_gpu_v41_one_cb_token_end(void);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,
