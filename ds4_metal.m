@@ -13042,6 +13042,27 @@ static uint32_t ds4_gpu_stream_expert_popcount(uint32_t mask) {
     return (uint32_t)__builtin_popcount(mask);
 }
 
+static uint32_t ds4_gpu_stream_expert_split_min_misses(void) {
+    /*
+     * DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES overrides the miss count at
+     * which the split (resident-first, deferred-miss) routed path is chosen.
+     * Default 3 keeps the upstream heuristic; 1 or 2 lets small caches hide
+     * single-expert SSD reads behind resident expert work.
+     */
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES");
+        int value = 3;
+        if (env && *env) {
+            value = atoi(env);
+            if (value < 1) value = 1;
+            if (value > 6) value = 6;
+        }
+        cached = value;
+    }
+    return (uint32_t)cached;
+}
+
 static int ds4_gpu_stream_expert_split_worthwhile(
         uint32_t resident_mask,
         uint32_t missing_mask) {
@@ -13052,7 +13073,8 @@ static int ds4_gpu_stream_expert_split_worthwhile(
      * reads can be hidden by resident expert work.  With one or two misses,
      * especially in large caches, a single unsplit routed pass is faster.
      */
-    return ds4_gpu_stream_expert_popcount(missing_mask) >= 3u;
+    return ds4_gpu_stream_expert_popcount(missing_mask) >=
+           ds4_gpu_stream_expert_split_min_misses();
 }
 
 static void ds4_gpu_stream_expert_timing_note_selected(
