@@ -65,6 +65,7 @@ typedef struct {
     bool warm_weights;
     bool quality;
     bool ssd_streaming;
+    bool allow_external_engram_outside;
     bool ssd_streaming_cold;
     bool ssd_streaming_full_layers_set;
     bool cuda_tensor_parallel;
@@ -330,6 +331,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.quality = true;
         } else if (!strcmp(arg, "--ssd-streaming")) {
             c.ssd_streaming = true;
+        } else if (!strcmp(arg, "--allow-external-engram-outside")) {
+            c.allow_external_engram_outside = true;
         } else if (!strcmp(arg, "--ssd-streaming-cold")) {
             c.ssd_streaming_cold = true;
         } else if (!strcmp(arg, "--ssd-streaming-cache-experts")) {
@@ -665,6 +668,7 @@ int main(int argc, char **argv) {
         .dspark_confidence_threshold_set = cfg.dspark_confidence_threshold_set,
         .cuda_tensor_parallel = cfg.cuda_tensor_parallel,
         .ssd_streaming = cfg.ssd_streaming,
+        .allow_external_engram_outside = cfg.allow_external_engram_outside,
         .ssd_streaming_cold = cfg.ssd_streaming_cold,
         .ssd_streaming_full_layers_set = cfg.ssd_streaming_full_layers_set,
         .expert_profile_path = cfg.expert_profile_path,
