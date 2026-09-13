@@ -2896,6 +2896,22 @@ int ds4_gpu_routed_moe_one_tensor(
         uint32_t                layer_index,
         bool                    force_resident);
 
+/* V4.1 SSD-streaming route/read service handshake.  This is a no-op success
+ * unless DS4_METAL_V41_EVENT_HANDSHAKE=1 and its address-table prerequisite
+ * are active.  Call after router/select and before the shared expert. */
+int ds4_gpu_v41_event_handshake_begin(
+        const ds4_gpu_tensor *selected,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              gate_offset,
+        uint64_t              up_offset,
+        uint64_t              down_offset,
+        uint64_t              gate_expert_bytes,
+        uint64_t              down_expert_bytes,
+        uint32_t              n_total_expert,
+        uint32_t              n_selected,
+        uint32_t              layer);
+
 int ds4_gpu_routed_moe_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *gate,

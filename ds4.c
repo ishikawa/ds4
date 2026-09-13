@@ -40622,7 +40622,20 @@ static bool ds41_moe_after_route(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
+    uint64_t gate_row = 0, down_row = 0;
+    const bool handshake_shape =
+        tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) &&
+        tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row);
     return ds41_moe_route(g, m, l, token) &&
+           handshake_shape &&
+           ds4_gpu_v41_event_handshake_begin(
+               g->selected, m->map, m->size,
+               l->ffn_gate_exps->abs_offset,
+               l->ffn_up_exps->abs_offset,
+               l->ffn_down_exps->abs_offset,
+               gate_row * DS4_N_FF_EXP,
+               down_row * DS4_N_EMBD,
+               DS4_N_EXPERT, DS4_N_EXPERT_USED, il) &&
            ds41_moe_after_route(g, m, l, il);
 }
 
