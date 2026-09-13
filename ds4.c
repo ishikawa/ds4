@@ -40249,8 +40249,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     const bool layer_resident = g->streaming && g->quality;
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool queue_layers = g->tp_world == 2 && !g->imatrix &&
-        !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE");
+    const bool defer_layer_end = g->streaming && !layer_resident &&
+        g->tp_world == 1 && !g->imatrix &&
+        getenv("DS4_METAL_V41_STREAM_DEFER_LAYER_END") != NULL;
+    const bool queue_layers = defer_layer_end ||
+        (g->tp_world == 2 && !g->imatrix &&
+         !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (layer_resident)
@@ -40260,11 +40264,18 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
             ok = ds4_gpu_tensor_write(g->engram_rows, 0, g->rows[i], sizeof(g->rows[i]));
         }
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
-        /* TP gates already submit ordered, bounded command buffers. Drain
+        /* TP gates already submit ordered, bounded command buffers. The
+         * single-GPU streaming experiment commits the layer tail without
+         * waiting, so the next layer can be encoded while it runs. Drain
          * before overwriting the first Engram table's shared input at layer
          * 14, and before publishing the completed token to the CPU. */
-        const bool drain = !queue_layers || il == 13 || il + 1u == DS4_N_LAYER;
-        if (drain && !ds4_gpu_end_commands()) ok = false;
+        const bool drain = !ok || !queue_layers || il == 13 ||
+            il + 1u == DS4_N_LAYER;
+        if (drain) {
+            if (!ds4_gpu_end_commands()) ok = false;
+        } else if (defer_layer_end && !ds4_gpu_flush_commands()) {
+            ok = false;
+        }
         if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
         if (ok && g->imatrix)
             ok = imatrix_collect_tensor_batch(g->imatrix, g->norm, g->mid,
