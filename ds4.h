@@ -469,6 +469,24 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
                       int top_k, float top_p, float min_p, uint64_t *rng);
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng);
 #ifdef DS4_TEST_HOOKS
+typedef struct {
+    uint64_t file_bytes;
+    uint64_t tensor_count;
+    uint32_t stages;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t target_layer_count;
+    uint32_t markov_rank;
+    uint32_t missing_tensors;
+    uint32_t invalid_tensors;
+    uint32_t metadata_errors;
+    int has_hc_head;
+} ds4_test_v41_dspark_support_result;
+int ds4_test_v41_dspark_support_model(
+        const char *path,
+        const char *base_revision,
+        uint64_t resident_budget,
+        ds4_test_v41_dspark_support_result *result);
 int ds4_test_sample_logits(const float *logits, uint32_t n_vocab,
                            float temperature, int top_k,
                            float top_p, float min_p, uint64_t *rng,

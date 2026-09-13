@@ -2752,6 +2752,8 @@ typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     bool has_metadata;
@@ -2764,6 +2766,8 @@ typedef struct {
     bool has_markov_rank;
     bool has_noise_token_id;
     bool has_target_layers;
+    bool has_n_expert;
+    bool has_n_expert_used;
 } ds4_dspark_summary;
 
 typedef enum {
@@ -2844,6 +2848,12 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
         "deepseek4.dspark_target_layer_ids",
         "dspark.target_layer_ids",
     };
+    static const char *const expert_keys[] = {
+        "dspark.expert_count",
+    };
+    static const char *const expert_used_keys[] = {
+        "dspark.expert_used_count",
+    };
 
     ds4_dspark_summary s = {0};
     if (model_get_u32_any(m, block_keys, sizeof(block_keys) / sizeof(block_keys[0]),
@@ -2869,6 +2879,18 @@ static ds4_dspark_summary model_dspark_summary(const ds4_model *m) {
                                 &s.target_layer_count)) {
         s.has_metadata = true;
         s.has_target_layers = true;
+    }
+    if (model_get_u32_any(m, expert_keys,
+                          sizeof(expert_keys) / sizeof(expert_keys[0]),
+                          &s.n_expert)) {
+        s.has_metadata = true;
+        s.has_n_expert = true;
+    }
+    if (model_get_u32_any(m, expert_used_keys,
+                          sizeof(expert_used_keys) / sizeof(expert_used_keys[0]),
+                          &s.n_expert_used)) {
+        s.has_metadata = true;
+        s.has_n_expert_used = true;
     }
 
     uint32_t max_stage = 0;
@@ -2901,6 +2923,8 @@ static void model_print_dspark_summary(const ds4_model *m) {
     if (s.block_size) printf(" block=%u", s.block_size);
     if (s.markov_rank) printf(" markov_rank=%u", s.markov_rank);
     if (s.noise_token_id) printf(" noise_token=%u", s.noise_token_id);
+    if (s.n_expert) printf(" experts=%u", s.n_expert);
+    if (s.n_expert_used) printf(" top_k=%u", s.n_expert_used);
     if (s.target_layer_count) {
         printf(" target_layers=");
         for (uint32_t i = 0; i < s.target_layer_count; i++) {
@@ -3111,17 +3135,54 @@ static ds4_support_kind support_model_detect(
     return DS4_SUPPORT_NONE;
 }
 
-static bool support_model_checkpoint_compatible(const ds4_model *m) {
+static bool support_model_v41_checkpoint_compatible(
+        const ds4_model *support,
+        ds4_str         base_revision) {
+    ds4_str architecture = {0};
+    ds4_str support_revision = {0};
+    if (!model_get_string(support, "general.architecture", &architecture) ||
+        !ds4_streq(architecture, "deepseek4-dspark")) {
+        fprintf(stderr,
+                "ds4: V4.1 support model architecture must be deepseek4-dspark\n");
+        return false;
+    }
+    if (base_revision.len == 0 ||
+        !model_get_string(support, "general.source.revision", &support_revision) ||
+        support_revision.len != base_revision.len ||
+        memcmp(support_revision.ptr, base_revision.ptr,
+               (size_t)base_revision.len) != 0) {
+        fprintf(stderr,
+                "ds4: V4.1 support model source revision does not match the base checkpoint\n");
+        return false;
+    }
+    return true;
+}
+
+static bool support_model_checkpoint_compatible(
+        const ds4_model *base,
+        const ds4_model *support) {
+    ds4_str base_architecture = {0};
+    if (model_get_string(base, "general.architecture", &base_architecture) &&
+        ds4_streq(base_architecture, "deepseek41")) {
+        ds4_str base_revision = {0};
+        if (!model_get_string(base, "general.source.revision", &base_revision)) {
+            fprintf(stderr,
+                    "ds4: V4.1 base model is missing general.source.revision\n");
+            return false;
+        }
+        return support_model_v41_checkpoint_compatible(support, base_revision);
+    }
+
     static const char vision_exp_revision[] =
         "e46e16bf6035c6f317eb2ac7458eb0362926d402";
     ds4_str variant = {0};
     const bool has_variant =
-        model_get_string(m, "deepseek4.checkpoint_variant", &variant);
+        model_get_string(support, "deepseek4.checkpoint_variant", &variant);
 
     if (g_ds4_flash_vision_exp) {
         ds4_str revision = {0};
         if (!has_variant || !ds4_streq(variant, "vision-exp") ||
-            !model_get_string(m, "general.source.revision", &revision) ||
+            !model_get_string(support, "general.source.revision", &revision) ||
             !ds4_streq(revision, vision_exp_revision)) {
             fprintf(stderr,
                     "ds4: DSpark support model does not match the pinned "
@@ -4519,6 +4580,8 @@ typedef struct {
     uint32_t block_size;
     uint32_t markov_rank;
     uint32_t noise_token_id;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
     uint32_t target_layer_count;
     uint32_t target_layers[DS4_DSPARK_MAX_TARGET_LAYERS];
     uint32_t present_tensors;
@@ -5736,6 +5799,14 @@ static void dspark_weights_validate_metadata(ds4_dspark_weights *dw) {
     if (!dw->has_noise_token_id || dw->noise_token_id >= DS4_N_VOCAB) {
         dspark_weights_note_metadata_error(dw, "missing or out-of-range noise token");
     }
+    if (dw->n_expert == 0) {
+        dspark_weights_note_metadata_error(dw, "expert count is zero");
+    }
+    if (dw->n_expert_used < 1 || dw->n_expert_used > 8) {
+        dspark_weights_note_metadata_error(dw, "expert top-k is outside 1..8");
+    } else if (dw->n_expert_used > dw->n_expert) {
+        dspark_weights_note_metadata_error(dw, "expert top-k exceeds expert count");
+    }
     if (!dw->has_target_layers || dw->target_layer_count == 0) {
         dspark_weights_note_metadata_error(dw, "missing target layer list");
         return;
@@ -5812,19 +5883,19 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, dw->n_expert, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  dw->n_expert, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, dw->n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, dw->n_expert);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, dw->n_expert);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -7866,6 +7937,9 @@ static void dspark_weights_bind_optional(
     dw->block_size = summary->block_size;
     dw->markov_rank = summary->markov_rank;
     dw->noise_token_id = summary->noise_token_id;
+    dw->n_expert = summary->has_n_expert ? summary->n_expert : DS4_N_EXPERT;
+    dw->n_expert_used = summary->has_n_expert_used ?
+                        summary->n_expert_used : DS4_N_EXPERT_USED;
     dw->target_layer_count = summary->target_layer_count;
     dw->has_block_size = summary->has_block_size;
     dw->has_markov_rank = summary->has_markov_rank;
@@ -7888,13 +7962,18 @@ static void dspark_weights_bind_optional(
     if (dw->n_stages != 0) {
         const uint32_t final_stage = dw->n_stages - 1u;
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
+        const bool require_hc_head =
+            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41;
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
         sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight",
+                               require_hc_head);
         sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight",
+                               require_hc_head);
         sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight",
+                               require_hc_head);
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =
@@ -7904,6 +7983,18 @@ static void dspark_weights_bind_optional(
     }
 
     dspark_weights_validate_layout(dw);
+}
+
+static bool dspark_weights_v41_contract_valid(
+        const ds4_dspark_weights *dw,
+        uint32_t                  support_stages) {
+    return dw && support_stages == 3 &&
+           dw->n_expert == 128 && dw->n_expert_used == 3 &&
+           dw->target_layer_count == 3 &&
+           dw->target_layers[0] == 37 && dw->target_layers[1] == 38 &&
+           dw->target_layers[2] == 39 && dw->markov_rank == 256 &&
+           dw->missing_tensors == 0 && dw->invalid_tensors == 0 &&
+           dw->metadata_errors == 0;
 }
 
 static void weights_free(ds4_weights *w) {
@@ -41136,6 +41227,7 @@ struct ds4_engine {
     bool glm_mtp;
     bool glm_mtp_timing;
     bool dspark;
+    bool v41_dspark_spec;
     bool dspark_strict;
     bool dspark_exact_sampling;
     bool cuda_tensor_parallel;
@@ -65598,6 +65690,80 @@ int ds4_test_session_read_logits(ds4_session *s, float *out,
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
 }
+
+int ds4_test_v41_dspark_support_model(
+        const char *path,
+        const char *base_revision,
+        uint64_t resident_budget,
+        ds4_test_v41_dspark_support_result *result) {
+    if (!path || !base_revision || !result) return 1;
+    memset(result, 0, sizeof(*result));
+
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    ds4_model support = {.fd = -1};
+    model_open(&support, path, false, false);
+
+    result->file_bytes = support.file_size;
+    result->tensor_count = support.n_tensors;
+    ds4_str revision = {
+        .ptr = base_revision,
+        .len = strlen(base_revision),
+    };
+    bool ok = support_model_v41_checkpoint_compatible(&support, revision);
+    ds4_dspark_summary summary = {0};
+    uint32_t stages = 0;
+    const ds4_support_kind kind =
+        support_model_detect(&support, &stages, &summary);
+    ds4_dspark_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    if (kind == DS4_SUPPORT_DSPARK) {
+        dspark_weights_bind_optional(&weights, &support, &summary);
+    } else {
+        fprintf(stderr,
+                "ds4: V4.1 support fixture is not a DSpark support model\n");
+        ok = false;
+    }
+
+    result->stages = stages;
+    result->n_expert = weights.n_expert;
+    result->n_expert_used = weights.n_expert_used;
+    result->target_layer_count = weights.target_layer_count;
+    result->markov_rank = weights.markov_rank;
+    result->missing_tensors = weights.missing_tensors;
+    result->invalid_tensors = weights.invalid_tensors;
+    result->metadata_errors = weights.metadata_errors;
+    if (weights.n_stages != 0) {
+        const ds4_dspark_stage_weights *final =
+            &weights.stage[weights.n_stages - 1u];
+        result->has_hc_head = final->hc_head_base || final->hc_head_fn ||
+                              final->hc_head_scale;
+    }
+
+    if (resident_budget != 0 && support.file_size > resident_budget) {
+        fprintf(stderr,
+                "ds4: V4.1 DSpark support model needs %.2f GiB resident, "
+                "budget is %.2f GiB\n",
+                ds4_bytes_to_gib(support.file_size),
+                ds4_bytes_to_gib(resident_budget));
+        ok = false;
+    }
+    if (!dspark_weights_v41_contract_valid(&weights, stages)) {
+        fprintf(stderr,
+                "ds4: V4.1 DSpark support binding failed "
+                "(stages=%u experts=%u top_k=%u targets=%u markov_rank=%u "
+                "missing=%u invalid=%u metadata_errors=%u)\n",
+                stages, weights.n_expert, weights.n_expert_used,
+                weights.target_layer_count, weights.markov_rank,
+                weights.missing_tensors, weights.invalid_tensors,
+                weights.metadata_errors);
+        ok = false;
+    }
+
+    model_close(&support);
+    g_ds4_shape = saved_shape;
+    return ok ? 0 : 1;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
@@ -65628,11 +65794,27 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
+    /* V4.1 support weights are a separate resident allocation. They must not
+     * borrow from the routed-expert streaming cache budget. */
+    const uint64_t support_bytes =
+        e->v41_dspark_spec ? e->mtp_model.size : 0;
+    const uint64_t base_weights = weights;
+    weights = ds4_add_sat_u64(weights, support_bytes);
     const uint64_t fixed = ds4_add_sat_u64(weights,
+        ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
+    const uint64_t fixed_without_support = ds4_add_sat_u64(base_weights,
         ds4_add_sat_u64(graph_bytes, 2u * gib + e->ssd_streaming_prefill_headroom_bytes));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
     if (fixed >= budget || (expert && budget - fixed < expert)) {
+        if (support_bytes && fixed_without_support < budget &&
+            support_bytes >= budget - fixed_without_support) {
+            fprintf(stderr,
+                    "ds4: V4.1 DSpark support model needs %.2f GiB resident, "
+                    "but only %.2f GiB remains in the safe memory budget\n",
+                    ds4_bytes_to_gib(support_bytes),
+                    ds4_bytes_to_gib(budget - fixed_without_support));
+        }
         fprintf(stderr, "ds4: V4.1 needs %.2f GiB before the expert cache; safe budget %.2f GiB. "
                         "Use --ssd-streaming or a smaller context.\n",
                 ds4_bytes_to_gib(fixed), ds4_bytes_to_gib(budget));
@@ -65809,12 +65991,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
         return 1;
     }
     config_validate_model(&e->model);
+    const char *v41_dspark_spec_env = getenv("DS4_V41_DSPARK_SPEC");
+    e->v41_dspark_spec =
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        v41_dspark_spec_env && !strcmp(v41_dspark_spec_env, "1") &&
+        opt->mtp_path && opt->mtp_path[0];
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = e->backend == DS4_BACKEND_METAL &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->dspark && !opt->glm_mtp &&
             !opt->first_token_test && !opt->metal_graph_test &&
-            (!opt->mtp_path || !opt->mtp_path[0]) &&
+            ((!opt->mtp_path || !opt->mtp_path[0]) || e->v41_dspark_spec) &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
@@ -66135,7 +66322,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             ds4_dspark_summary dspark = {0};
             e->support_kind =
                 support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
-            if (!support_model_checkpoint_compatible(&e->mtp_model)) {
+            if (!support_model_checkpoint_compatible(&e->model,
+                                                     &e->mtp_model)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -66232,7 +66420,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (opt->mtp_path && opt->mtp_path[0] &&
         opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-        if (e->ssd_streaming) {
+        if (e->ssd_streaming && !e->v41_dspark_spec) {
             fprintf(stderr, "ds4: --ssd-streaming is not compatible with --mtp-model yet\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -66242,7 +66430,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
-        if (!support_model_checkpoint_compatible(&e->mtp_model)) {
+        if (!support_model_checkpoint_compatible(&e->model,
+                                                 &e->mtp_model)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -66266,11 +66455,29 @@ static int ds4_engine_open_internal(ds4_engine **out,
             dspark_weights_bind_optional(&e->dspark_weights,
                                          &e->mtp_model,
                                          &dspark);
+            if (e->v41_dspark_spec &&
+                !dspark_weights_v41_contract_valid(&e->dspark_weights,
+                                                   e->support_stages)) {
+                fprintf(stderr,
+                        "ds4: V4.1 DSpark support binding failed "
+                        "(stages=%u experts=%u top_k=%u targets=%u "
+                        "markov_rank=%u missing=%u invalid=%u metadata_errors=%u)\n",
+                        e->support_stages,
+                        e->dspark_weights.n_expert,
+                        e->dspark_weights.n_expert_used,
+                        e->dspark_weights.target_layer_count,
+                        e->dspark_weights.markov_rank,
+                        e->dspark_weights.missing_tensors,
+                        e->dspark_weights.invalid_tensors,
+                        e->dspark_weights.metadata_errors);
+                ds4_engine_close(e);
+                *out = NULL;
+                return 1;
+            }
             fprintf(stderr,
                     "ds4: DSpark support model detected: %s "
                     "(stages=%u block=%u markov_rank=%u tensors=%u missing=%u "
-                    "invalid=%u metadata_errors=%u); "
-                    "use --dspark to enable experimental runtime decode\n",
+                    "invalid=%u metadata_errors=%u)%s\n",
                     opt->mtp_path,
                     e->support_stages,
                     dspark.block_size,
@@ -66278,7 +66485,14 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     e->dspark_weights.present_tensors,
                     e->dspark_weights.missing_tensors,
                     e->dspark_weights.invalid_tensors,
-                    e->dspark_weights.metadata_errors);
+                    e->dspark_weights.metadata_errors,
+                    e->v41_dspark_spec ? "" :
+                        "; use --dspark to enable experimental runtime decode");
+            if (e->v41_dspark_spec) {
+                fprintf(stderr,
+                        "ds4: V4.1 DSpark support bound; speculative decode "
+                        "not implemented yet\n");
+            }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
                         "ds4: DSpark direct verifier-state commits enabled; "
