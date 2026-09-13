@@ -25,8 +25,13 @@ INTEGRITY_KEYS = (
     "deepseek41.engram.sidecar_sample_scheme",
 )
 DECODE_KEYS = {
+    "general.architecture",
     "general.alignment",
+    "general.source.revision",
     "deepseek41.config",
+    "deepseek41.calibration",
+    "deepseek41.quantization",
+    "deepseek41.engram.encoding",
     "deepseek41.engram.storage",
     "deepseek41.engram.external_paths",
     "deepseek41.engram.external_offsets",
@@ -88,6 +93,7 @@ def skip_value(fp, kind, label):
 
 def read_header(path):
     records = []
+    tensors = []
     values = {}
     with open(path, "rb") as fp:
         if read_exact(fp, 4, "GGUF magic") != b"GGUF":
@@ -114,12 +120,15 @@ def read_header(path):
             records.append((key, read_exact(fp, end - start, key)))
         tensor_info_start = fp.tell()
         for index in range(tensor_count):
-            read_gguf_string(fp, f"tensor {index} name")
+            name = read_gguf_string(fp, f"tensor {index} name")
             rank = read_u32(fp, f"tensor {index} rank")
             if rank > 4:
                 raise ValueError(f"tensor {index}: unreasonable rank {rank}")
-            read_exact(fp, rank * 8, f"tensor {index} dimensions")
-            read_exact(fp, 12, f"tensor {index} type and offset")
+            shape = tuple(read_u64(fp, f"tensor {index} dimension")
+                          for _ in range(rank))
+            qtype = read_u32(fp, f"tensor {index} type")
+            offset = read_u64(fp, f"tensor {index} offset")
+            tensors.append((name, shape, qtype, offset))
         tensor_info_end = fp.tell()
         alignment = values.get("general.alignment", (None, GGUF_ALIGNMENT))
         if alignment[0] != GGUF_UINT32 or not alignment[1]:
@@ -139,6 +148,7 @@ def read_header(path):
         "keys": keys,
         "values": values,
         "tensor_records": tensor_records,
+        "tensors": tensors,
         "data_start": data_start,
         "original": original,
     }
