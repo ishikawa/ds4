@@ -160,6 +160,28 @@ Pass `--quant q4` to the audit as well when checking a Q4 file.
 The audit checks the complete layout, all non-expert tensors, sampled experts
 and native Engram rows. It does not replace [inference quality tests](quality-testing/deepseek-v4.1-flash-20260910/README.md).
 
+### Convert the V4.1 MTP support model
+
+Convert the three MTP/DSpark stages to a separate support GGUF. The dry-run
+only needs `config.json` and `model.safetensors.index.json`; conversion only
+opens the three shards containing `mtp.*` (44--46 in the released index):
+
+```sh
+python3 gguf-tools/deepseek41_mtp_quantize.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --out gguf/DeepSeek-V4.1-Flash-DSpark-support.gguf \
+  --source-revision FULL_40_HEX_REVISION --dry-run
+
+python3 gguf-tools/deepseek41_mtp_quantize.py \
+  --hf models/DeepSeek-V4.1-Flash \
+  --out gguf/DeepSeek-V4.1-Flash-DSpark-support.gguf \
+  --source-revision FULL_40_HEX_REVISION --threads 8
+```
+
+The support recipe is IQ2_XXS routed gate/up, Q2_K routed down, and Q8_0
+dense weights. Runtime admission and speculative verification for V4.1 are a
+separate implementation step; producing the support file does not enable it.
+
 ## Convert A DSpark Support Checkpoint
 
 The DSpark Flash checkpoint is published as Hugging Face safetensors and stores
