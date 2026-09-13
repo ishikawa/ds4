@@ -784,6 +784,20 @@ static uint64_t g_v41_one_cb_command_buffers;
 static uint32_t g_v41_one_cb_command_buffers_current;
 static uint32_t g_v41_one_cb_command_buffers_max;
 static int g_v41_one_cb_token_active;
+static int g_v41_decode_token_timing_active;
+static pthread_mutex_t g_v41_one_cb_timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_v41_one_cb_commit_seq;
+static double g_v41_one_cb_encode_start_seconds;
+static double g_v41_one_cb_first_commit_seconds;
+static double g_v41_one_cb_first_gpu_start_seconds;
+static double g_v41_one_cb_last_commit_seconds;
+static double g_v41_one_cb_last_gpu_end_seconds;
+static uint64_t g_v41_one_cb_last_gpu_end_seq;
+static uint64_t g_v41_one_cb_timing_samples;
+static double g_v41_one_cb_encode_to_first_commit_seconds;
+static double g_v41_one_cb_first_commit_to_gpu_start_seconds;
+static double g_v41_one_cb_last_commit_to_gpu_end_seconds;
+static double g_v41_one_cb_wall_seconds;
 static uint64_t g_stream_expert_timing_load_calls;
 static double g_stream_expert_timing_load_prepare_ms;
 static double g_stream_expert_timing_load_pread_ms;
@@ -1462,6 +1476,8 @@ static ds4_gpu_time_profile_stats g_gpu_time_profile_decode;
 static mach_timebase_info_data_t g_gpu_time_profile_timebase;
 
 static double ds4_gpu_time_profile_now_seconds(void) {
+    if (g_gpu_time_profile_timebase.denom == 0)
+        (void)mach_timebase_info(&g_gpu_time_profile_timebase);
     return (double)mach_absolute_time() *
            (double)g_gpu_time_profile_timebase.numer /
            (double)g_gpu_time_profile_timebase.denom * 1.0e-9;
@@ -1520,6 +1536,27 @@ static void ds4_gpu_commit_command_buffer(id<MTLCommandBuffer> cb) {
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [cb addCompletedHandler:^(__unused id<MTLCommandBuffer> completed) {
             dispatch_semaphore_signal(done);
+        }];
+    }
+    __block uint64_t one_cb_seq = 0;
+    __block double one_cb_commit_seconds = 0.0;
+    if (g_v41_decode_token_timing_active) {
+        one_cb_commit_seconds = ds4_gpu_time_profile_now_seconds();
+        pthread_mutex_lock(&g_v41_one_cb_timing_mutex);
+        one_cb_seq = ++g_v41_one_cb_commit_seq;
+        if (one_cb_seq == 1)
+            g_v41_one_cb_first_commit_seconds = one_cb_commit_seconds;
+        g_v41_one_cb_last_commit_seconds = one_cb_commit_seconds;
+        pthread_mutex_unlock(&g_v41_one_cb_timing_mutex);
+        [cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            pthread_mutex_lock(&g_v41_one_cb_timing_mutex);
+            if (one_cb_seq == 1)
+                g_v41_one_cb_first_gpu_start_seconds = done.GPUStartTime;
+            if (one_cb_seq >= g_v41_one_cb_last_gpu_end_seq) {
+                g_v41_one_cb_last_gpu_end_seq = one_cb_seq;
+                g_v41_one_cb_last_gpu_end_seconds = done.GPUEndTime;
+            }
+            pthread_mutex_unlock(&g_v41_one_cb_timing_mutex);
         }];
     }
     if (!g_gpu_time_profile_enabled) {
@@ -4716,6 +4753,25 @@ static void ds4_gpu_stream_expert_timing_print(
                     (double)g_v41_handshake_queue_depth_sum / queue_samples :
                     0.0,
                 g_v41_handshake_queue_depth_max);
+        const double token_samples = (double)g_v41_one_cb_timing_samples;
+        fprintf(stderr,
+                "ds4:   V4.1 decode token timing samples=%llu "
+                "encode_to_first_commit_avg=%.3f ms "
+                "first_commit_to_gpu_start_avg=%.3f ms "
+                "last_commit_to_gpu_done_avg=%.3f ms "
+                "token_wall_avg=%.3f ms\n",
+                (unsigned long long)g_v41_one_cb_timing_samples,
+                token_samples ? 1.0e3 *
+                    g_v41_one_cb_encode_to_first_commit_seconds /
+                    token_samples : 0.0,
+                token_samples ? 1.0e3 *
+                    g_v41_one_cb_first_commit_to_gpu_start_seconds /
+                    token_samples : 0.0,
+                token_samples ? 1.0e3 *
+                    g_v41_one_cb_last_commit_to_gpu_end_seconds /
+                    token_samples : 0.0,
+                token_samples ? 1.0e3 * g_v41_one_cb_wall_seconds /
+                    token_samples : 0.0);
     }
     if (s.cpu_gap_calls != 0) {
         fprintf(stderr,
@@ -10086,6 +10142,8 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
+    if (g_v41_one_cb_token_active)
+        g_v41_one_cb_command_buffers_current++;
     ds4_gpu_stream_expert_timing_note_next_commit();
     ds4_gpu_commit_command_buffer(cb);
     [g_pending_cbs addObject:cb];
@@ -15161,14 +15219,78 @@ int ds4_gpu_v41_one_cb_enabled(void) {
     static int logged;
     if (!logged) {
         logged = 1;
-        fprintf(stderr, "ds4: V4.1 one command buffer per token enabled\n");
+        fprintf(stderr,
+                "ds4: V4.1 one command buffer per token enabled "
+                "(chunk=%u layers)\n",
+                ds4_gpu_v41_cb_chunk_layers());
     }
     return 1;
+}
+
+uint32_t ds4_gpu_v41_cb_chunk_layers(void) {
+    const char *value = getenv("DS4_METAL_V41_CB_CHUNK_LAYERS");
+    if (!value || !value[0]) return 40u;
+    char *end = NULL;
+    errno = 0;
+    const long layers = strtol(value, &end, 10);
+    if (errno == 0 && end && *end == '\0' && layers >= 1 && layers <= 40)
+        return (uint32_t)layers;
+    static int warned;
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr,
+                "ds4: warning: DS4_METAL_V41_CB_CHUNK_LAYERS must be "
+                "1..40; using 40\n");
+    }
+    return 40u;
+}
+
+void ds4_gpu_v41_decode_token_timing_begin(void) {
+    pthread_mutex_lock(&g_v41_one_cb_timing_mutex);
+    g_v41_one_cb_commit_seq = 0;
+    g_v41_one_cb_encode_start_seconds =
+        ds4_gpu_time_profile_now_seconds();
+    g_v41_one_cb_first_commit_seconds = 0.0;
+    g_v41_one_cb_first_gpu_start_seconds = 0.0;
+    g_v41_one_cb_last_commit_seconds = 0.0;
+    g_v41_one_cb_last_gpu_end_seconds = 0.0;
+    g_v41_one_cb_last_gpu_end_seq = 0;
+    g_v41_decode_token_timing_active = 1;
+    pthread_mutex_unlock(&g_v41_one_cb_timing_mutex);
+}
+
+void ds4_gpu_v41_decode_token_timing_end(void) {
+    if (!g_v41_decode_token_timing_active) return;
+    const double wall_end_seconds = ds4_gpu_time_profile_now_seconds();
+    pthread_mutex_lock(&g_v41_one_cb_timing_mutex);
+    if (g_v41_one_cb_first_commit_seconds >=
+            g_v41_one_cb_encode_start_seconds &&
+        g_v41_one_cb_first_gpu_start_seconds >=
+            g_v41_one_cb_first_commit_seconds &&
+        g_v41_one_cb_last_gpu_end_seconds >=
+            g_v41_one_cb_last_commit_seconds &&
+        wall_end_seconds >= g_v41_one_cb_encode_start_seconds) {
+        g_v41_one_cb_timing_samples++;
+        g_v41_one_cb_encode_to_first_commit_seconds +=
+            g_v41_one_cb_first_commit_seconds -
+            g_v41_one_cb_encode_start_seconds;
+        g_v41_one_cb_first_commit_to_gpu_start_seconds +=
+            g_v41_one_cb_first_gpu_start_seconds -
+            g_v41_one_cb_first_commit_seconds;
+        g_v41_one_cb_last_commit_to_gpu_end_seconds +=
+            g_v41_one_cb_last_gpu_end_seconds -
+            g_v41_one_cb_last_commit_seconds;
+        g_v41_one_cb_wall_seconds += wall_end_seconds -
+            g_v41_one_cb_encode_start_seconds;
+    }
+    g_v41_decode_token_timing_active = 0;
+    pthread_mutex_unlock(&g_v41_one_cb_timing_mutex);
 }
 
 void ds4_gpu_v41_one_cb_token_begin(void) {
     g_v41_one_cb_command_buffers_current = 0;
     g_v41_one_cb_token_active = 1;
+    ds4_gpu_v41_decode_token_timing_begin();
 }
 
 void ds4_gpu_v41_one_cb_token_end(void) {
@@ -15181,6 +15303,7 @@ void ds4_gpu_v41_one_cb_token_end(void) {
             g_v41_one_cb_command_buffers_current;
     }
     g_v41_one_cb_token_active = 0;
+    ds4_gpu_v41_decode_token_timing_end();
 }
 
 static int ds4_gpu_stream_expert_hit_validator_requested(void) {

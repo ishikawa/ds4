@@ -2914,6 +2914,9 @@ int ds4_gpu_v41_event_handshake_begin(
 
 /* Decode-only graph batching built on the V4.1 event handshake. */
 int  ds4_gpu_v41_one_cb_enabled(void);
+uint32_t ds4_gpu_v41_cb_chunk_layers(void);
+void ds4_gpu_v41_decode_token_timing_begin(void);
+void ds4_gpu_v41_decode_token_timing_end(void);
 void ds4_gpu_v41_one_cb_token_begin(void);
 void ds4_gpu_v41_one_cb_token_end(void);
 

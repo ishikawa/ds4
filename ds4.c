@@ -41073,6 +41073,12 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     const bool one_cb = g->streaming && !layer_resident &&
         g->tp_world == 1 && !g->imatrix &&
         ds4_gpu_v41_one_cb_enabled();
+    const bool defer_layer_end = g->streaming && !layer_resident &&
+        g->tp_world == 1 && !g->imatrix &&
+        getenv("DS4_METAL_V41_STREAM_DEFER_LAYER_END") != NULL;
+    const bool token_timing = one_cb || defer_layer_end;
+    const uint32_t cb_chunk_layers = one_cb ?
+        ds4_gpu_v41_cb_chunk_layers() : DS4_N_LAYER;
     ds4_gpu_tensor *engram_rows_base = g->engram_rows;
     ds4_gpu_tensor *one_cb_engram[2] = {NULL, NULL};
     const uint64_t engram_bytes = sizeof(g->rows[0]);
@@ -41099,8 +41105,10 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         return false;
     }
     if (one_cb) ds4_gpu_v41_one_cb_token_begin();
+    else if (token_timing) ds4_gpu_v41_decode_token_timing_begin();
     if (!ds4_gpu_begin_commands()) {
         if (one_cb) ds4_gpu_v41_one_cb_token_end();
+        else if (token_timing) ds4_gpu_v41_decode_token_timing_end();
         ds4_gpu_tensor_free(one_cb_engram[0]);
         ds4_gpu_tensor_free(one_cb_engram[1]);
         return false;
@@ -41109,9 +41117,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     /* Unfused quality kernels bind whole expert tensors. Keep just the current
      * layer mapped, using the same admitted reserve as layer-major prefill. */
     if (layer_resident && !ds4_gpu_end_commands()) ok = false;
-    const bool defer_layer_end = g->streaming && !layer_resident &&
-        g->tp_world == 1 && !g->imatrix &&
-        getenv("DS4_METAL_V41_STREAM_DEFER_LAYER_END") != NULL;
     const bool queue_layers = one_cb || defer_layer_end ||
         (g->tp_world == 2 && !g->imatrix &&
          !getenv("DS4_METAL_DISABLE_V41_TP_DECODE_QUEUE"));
@@ -41147,12 +41152,17 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
         }
         if (ok) ok = ds41_graph_layer(g, m, l, il, token);
         /* TP gates already submit ordered, bounded command buffers. Deferred
-         * streaming commits layer tails without waiting. One-CB decode keeps
-         * both Engram inputs distinct and carries the graph through logits. */
+         * streaming commits layer tails without waiting. Chunked one-CB
+         * decode keeps both Engram inputs distinct, submits each complete
+         * chunk without waiting, and carries the final chunk through logits. */
+        const bool chunk_end = one_cb && il + 1u < DS4_N_LAYER &&
+            (il + 1u) % cb_chunk_layers == 0;
         const bool drain = !ok || (!one_cb &&
             (!queue_layers || il == 13 || il + 1u == DS4_N_LAYER));
         if (drain) {
             if (!ds4_gpu_end_commands()) ok = false;
+        } else if (chunk_end && !ds4_gpu_flush_commands()) {
+            ok = false;
         } else if (!one_cb && defer_layer_end &&
                    !ds4_gpu_flush_commands()) {
             ok = false;
@@ -41167,7 +41177,6 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     }
     if (one_cb && ok && logits) ok = ds41_graph_logits_encode(g, m, w);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
-    if (one_cb) ds4_gpu_v41_one_cb_token_end();
     g->engram_rows = engram_rows_base;
     ds4_gpu_tensor_free(one_cb_engram[0]);
     ds4_gpu_tensor_free(one_cb_engram[1]);
@@ -41179,6 +41188,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) :
             ds41_graph_logits(g, m, w, logits);
     }
+    if (one_cb) ds4_gpu_v41_one_cb_token_end();
+    else if (token_timing) ds4_gpu_v41_decode_token_timing_end();
     if (!ok) {
         if (g->dspark) metal_graph_dspark_capture_row_invalidate(g->dspark);
         g->valid = false;
