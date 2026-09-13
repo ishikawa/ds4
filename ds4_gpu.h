@@ -89,6 +89,22 @@ typedef enum {
 } ds4_v41_activation_format;
 int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width, uint32_t rows,
                           ds4_v41_activation_format format);
+int ds4_gpu_dsv41_rms_norm_bf16(ds4_gpu_tensor *out, ds4_gpu_tensor *x,
+                               const void *model_map, uint64_t model_size,
+                               uint64_t weight_offset, uint32_t width,
+                               float eps, bool round_input);
+int ds4_gpu_dsv41_hc_weighted_sum_norm_bf16(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *weights,
+        const void *model_map, uint64_t model_size, uint64_t norm_weight_offset,
+        uint32_t width, float eps);
+int ds4_gpu_dsv41_add_bf16(ds4_gpu_tensor *out,
+                          const ds4_gpu_tensor *a, const ds4_gpu_tensor *b,
+                          uint32_t count);
+int ds4_gpu_dsv41_swiglu_bf16(ds4_gpu_tensor *out,
+                             const ds4_gpu_tensor *gate,
+                             const ds4_gpu_tensor *up,
+                             uint32_t count, float limit);
 /* Full-head prefill, with BF16 rounding between the two Q8 projections. */
 int ds4_gpu_dsv41_attention_output_batch(
         ds4_gpu_tensor *out, ds4_gpu_tensor *low,
@@ -105,6 +121,9 @@ int ds4_gpu_dsv41_attention_output_tp_batch(
 /* Adjacent-pair, unit-magnitude RoPE with the released V4.1 frequencies. */
 int ds4_gpu_dsv41_rope(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                       uint32_t rows, uint32_t start, bool compressed, bool inverse);
+int ds4_gpu_dsv41_rope_bf16_input(ds4_gpu_tensor *x, uint32_t width,
+                                 uint32_t heads, uint32_t rows, uint32_t start,
+                                 bool compressed, bool inverse);
 /* Compressed pairs advance two absolute token positions per stored row. */
 int ds4_gpu_dsv41_rope_stride(ds4_gpu_tensor *x, uint32_t width, uint32_t heads,
                              uint32_t rows, uint32_t start, uint32_t stride,
@@ -3068,6 +3087,13 @@ int ds4_gpu_hc_expand_add_tensor(
         uint32_t                n_hc);
 
 int ds4_gpu_hc_expand_split_tensor(
+        ds4_gpu_tensor       *out_hc,
+        const ds4_gpu_tensor *block_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc);
+int ds4_gpu_dsv41_hc_expand_split_bf16_tensor(
         ds4_gpu_tensor       *out_hc,
         const ds4_gpu_tensor *block_out,
         const ds4_gpu_tensor *residual_hc,

@@ -13,6 +13,179 @@ static inline float dsv41_bf16(float x) {
     return as_type<float>(bits & 0xffff0000u);
 }
 
+static inline float4 dsv41_bf16_4(float4 x) {
+    uint4 bits = as_type<uint4>(x);
+    const bool4 finite = (bits & 0x7f800000u) != 0x7f800000u;
+    bits += select(uint4(0), uint4(0x7fffu) + ((bits >> 16u) & 1u), finite);
+    return as_type<float4>(bits & 0xffff0000u);
+}
+
+struct ds4_metal_args_dsv41_rms_bf16 {
+    uint width;
+    uint round_input;
+    float eps;
+};
+
+// V4.1 places BF16 boundaries around selected RMSNorm operations. Keeping
+// both rounds here removes launches without changing the float4 reduction tree.
+kernel void kernel_dsv41_rms_norm_bf16(
+        constant ds4_metal_args_dsv41_rms_bf16 &args,
+        device float *x,
+        device const float4 *weight,
+        device float4 *dst,
+        threadgroup float *shared [[threadgroup(0)]],
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    if (sgitg == 0) shared[tiisg] = 0.0f;
+
+    device float4 *x4 = (device float4 *)x;
+    const uint n4 = args.width >> 2;
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        float4 v = x4[i];
+        if (args.round_input) {
+            v = dsv41_bf16_4(v);
+            x4[i] = v;
+        }
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) shared[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(shared[tiisg]);
+    const float scale = 1.0f / sqrt(sumf / float(args.width) + args.eps);
+    for (uint i = tid; i < n4; i += ntg) {
+        const float4 v = args.round_input ? x4[i] : ((device float4 *)x)[i];
+        dst[i] = dsv41_bf16_4((v * scale) * weight[i]);
+    }
+}
+
+struct ds4_metal_args_dsv41_hc_weighted_norm {
+    uint width;
+    float eps;
+};
+
+// Preserve weighted-sum, BF16, RMSNorm and BF16 as four explicit numerical
+// stages while keeping their intermediates inside one threadgroup dispatch.
+kernel void kernel_dsv41_hc_weighted_sum_bf16_norm_bf16(
+        constant ds4_metal_args_dsv41_hc_weighted_norm &args,
+        device const float *residual,
+        device const float *pre,
+        device float *dst,
+        device const float4 *weight,
+        device float4 *norm_dst,
+        threadgroup float4 *row,
+        ushort tid [[thread_position_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort ntg [[threads_per_threadgroup]]) {
+    const uint n4 = args.width >> 2;
+    float sumf = 0.0f;
+    for (uint i = tid; i < n4; i += ntg) {
+        float4 v;
+        for (uint j = 0; j < 4; ++j) {
+            const uint d = 4u*i + j;
+            float acc = 0.0f;
+            acc += residual[d + 0u*args.width] * pre[0];
+            acc += residual[d + 1u*args.width] * pre[1];
+            acc += residual[d + 2u*args.width] * pre[2];
+            acc += residual[d + 3u*args.width] * pre[3];
+            v[j] = dsv41_bf16(acc);
+            dst[d] = v[j];
+        }
+        row[i] = v;
+        sumf += dot(v, v);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup float *partial = (threadgroup float *)(row + n4);
+    if (sgitg == 0) partial[tiisg] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tiisg == 0) partial[sgitg] = sumf;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = simd_sum(partial[tiisg]);
+    const float scale = 1.0f / sqrt(sumf / float(args.width) + args.eps);
+    for (uint i = tid; i < n4; i += ntg) {
+        norm_dst[i] = dsv41_bf16_4((row[i] * scale) * weight[i]);
+    }
+}
+
+// HC=4 post expansion followed by the model's explicit BF16 boundary.
+kernel void kernel_dsv41_hc_expand4_bf16(
+        constant ds4_metal_args_dsv4_hc_expand &args,
+        device const char *block_out,
+        device const char *residual,
+        device const char *post,
+        device const char *comb,
+        device const char *block_add,
+        device char *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (args.n_hc != 4) return;
+    const int64_t n_elem = args.n_embd * args.n_tokens;
+    if ((int64_t)gid >= n_elem) return;
+    const int64_t d = (int64_t)gid % args.n_embd;
+    const int64_t t = (int64_t)gid / args.n_embd;
+
+    float block_v = *((device const float *)(block_out + d * args.nb_block0 + t * args.nb_block1));
+    if (args.has_add) {
+        block_v += *((device const float *)(block_add + d * args.nb_add0 + t * args.nb_add1));
+    }
+    const float r0 = *((device const float *)(residual + d * args.nb_res0 + 0 * args.nb_res1 + t * args.nb_res2));
+    const float r1 = *((device const float *)(residual + d * args.nb_res0 + 1 * args.nb_res1 + t * args.nb_res2));
+    const float r2 = *((device const float *)(residual + d * args.nb_res0 + 2 * args.nb_res1 + t * args.nb_res2));
+    const float r3 = *((device const float *)(residual + d * args.nb_res0 + 3 * args.nb_res1 + t * args.nb_res2));
+
+    for (int64_t dst_hc = 0; dst_hc < 4; ++dst_hc) {
+        float acc = block_v * *((device const float *)(post + dst_hc * args.nb_post0 + t * args.nb_post1));
+        acc += *((device const float *)(comb + dst_hc * args.nb_comb0 + 0 * args.nb_comb1 + t * args.nb_comb2)) * r0;
+        acc += *((device const float *)(comb + dst_hc * args.nb_comb0 + 1 * args.nb_comb1 + t * args.nb_comb2)) * r1;
+        acc += *((device const float *)(comb + dst_hc * args.nb_comb0 + 2 * args.nb_comb1 + t * args.nb_comb2)) * r2;
+        acc += *((device const float *)(comb + dst_hc * args.nb_comb0 + 3 * args.nb_comb1 + t * args.nb_comb2)) * r3;
+        *((device float *)(dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = dsv41_bf16(acc);
+    }
+}
+
+struct ds4_metal_args_dsv41_add_bf16 { uint count; };
+
+// The shared-down input has its own BF16 boundary before the routed sum; the
+// final sum is rounded again. Keeping both rounds here preserves that order.
+kernel void kernel_dsv41_add_bf16(
+        constant ds4_metal_args_dsv41_add_bf16 &args,
+        device const float *a,
+        device const float *b,
+        device float *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid < args.count)
+        dst[gid] = dsv41_bf16(a[gid] + dsv41_bf16(b[gid]));
+}
+
+struct ds4_metal_args_dsv41_swiglu_bf16 {
+    uint count;
+    float limit;
+};
+
+kernel void kernel_dsv41_swiglu_bf16(
+        constant ds4_metal_args_dsv41_swiglu_bf16 &args,
+        device const float *gate,
+        device const float *up,
+        device float *dst,
+        uint gid [[thread_position_in_grid]]) {
+    if (gid >= args.count) return;
+    float g = dsv41_bf16(gate[gid]);
+    float u = dsv41_bf16(up[gid]);
+    if (args.limit > 1.0e-6f) {
+        g = min(g, args.limit);
+        u = clamp(u, -args.limit, args.limit);
+    }
+    const float silu = g / (1.0f + exp(-g));
+    dst[gid] = dsv41_bf16(silu * u);
+}
+
 static inline float dsv41_pow2_ceil(float x) {
     const uint bits = as_type<uint>(x);
     return as_type<float>((bits & 0x7f800000u) +
@@ -40,7 +213,7 @@ kernel void kernel_dsv41_bf16_linear(
 }
 
 struct ds4_metal_args_dsv41_rope {
-    uint width, heads, rows, start, inverse, stride;
+    uint width, heads, rows, start, inverse, stride, round_input;
     float frequencies[32];
 };
 
@@ -52,9 +225,14 @@ kernel void kernel_dsv41_rope(
     const float theta = float(args.start + group.y * args.stride) * args.frequencies[lane];
     const float c = precise::cos(theta);
     const float s = args.inverse ? -precise::sin(theta) : precise::sin(theta);
-    const ulong i = ((ulong)group.y * args.heads + group.x) * args.width +
-                    args.width - 64u + 2u * lane;
-    const float re = x[i], im = x[i + 1u];
+    const ulong base = ((ulong)group.y * args.heads + group.x) * args.width;
+    if (args.round_input) {
+        for (uint j = lane; j + 64u < args.width; j += 32u)
+            x[base + j] = dsv41_bf16(x[base + j]);
+    }
+    const ulong i = base + args.width - 64u + 2u * lane;
+    const float re = args.round_input ? dsv41_bf16(x[i]) : x[i];
+    const float im = args.round_input ? dsv41_bf16(x[i + 1u]) : x[i + 1u];
     x[i] = dsv41_bf16(re * c - im * s);
     x[i + 1u] = dsv41_bf16(re * s + im * c);
 }

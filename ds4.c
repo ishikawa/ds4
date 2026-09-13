@@ -40141,6 +40141,11 @@ static bool ds41_bf16(ds4_gpu_tensor *x, uint32_t width) {
     return ds4_gpu_dsv41_quantize(x, width, 1, DS4_V41_BF16) != 0;
 }
 
+static bool ds41_fuse_small(void) {
+    const char *value = getenv("DS4_METAL_V41_FUSE_SMALL");
+    return value && strcmp(value, "1") == 0;
+}
+
 static bool ds41_matmul(ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *weight, const ds4_gpu_tensor *in, bool round) {
     return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0], weight->dim[1], in, 1) &&
@@ -40189,10 +40194,17 @@ static bool ds41_matmul_rows_batch(ds4_gpu_tensor *out, const ds4_model *m,
     return ds41_matmul_batch(out, m, &slice, in, rows, true);
 }
 
-static bool ds41_matmul_rows(ds4_gpu_tensor *out, const ds4_model *m,
-                             const ds4_tensor *weight, const ds4_gpu_tensor *in,
-                             uint32_t first, uint32_t count) {
-    return ds41_matmul_rows_batch(out, m, weight, in, first, count, 1);
+static bool ds41_matmul_rows_round(ds4_gpu_tensor *out, const ds4_model *m,
+                                   const ds4_tensor *weight,
+                                   const ds4_gpu_tensor *in, uint32_t first,
+                                   uint32_t count, bool round) {
+    uint64_t row_bytes;
+    if (first > weight->dim[1] || count > weight->dim[1] - first ||
+        !tensor_nbytes(weight->type, weight->dim[0], &row_bytes)) return false;
+    ds4_tensor slice = *weight;
+    slice.abs_offset += (uint64_t)first * row_bytes;
+    slice.dim[1] = count;
+    return ds41_matmul_batch(out, m, &slice, in, 1, round);
 }
 
 static const ds4_vision_span *ds41_image_at(const ds41_gpu_graph *g, uint32_t pos) {
@@ -40251,9 +40263,28 @@ static bool ds41_sum_partial(ds41_gpu_graph *g, ds4_gpu_tensor *x,
 
 static bool ds41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *in,
                       const ds4_model *m, const ds4_tensor *weight) {
+    if (ds41_fuse_small()) {
+        return ds4_gpu_dsv41_rms_norm_bf16(out, (ds4_gpu_tensor *)in,
+            m->map, m->size, weight->abs_offset,
+            (uint32_t)weight->dim[0], DS4_RMS_EPS, false) != 0;
+    }
     return ds4_gpu_rms_norm_weight_tensor(out, in, m->map, m->size,
         weight->abs_offset, (uint32_t)weight->dim[0], DS4_RMS_EPS) &&
         ds41_bf16(out, (uint32_t)weight->dim[0]);
+}
+
+static bool ds41_matmul_norm(ds4_gpu_tensor *out, const ds4_model *m,
+                             const ds4_tensor *projection,
+                             const ds4_gpu_tensor *in,
+                             const ds4_tensor *norm_weight) {
+    if (ds41_fuse_small()) {
+        return ds41_matmul(out, m, projection, in, false) &&
+            ds4_gpu_dsv41_rms_norm_bf16(out, out, m->map, m->size,
+                norm_weight->abs_offset, (uint32_t)norm_weight->dim[0],
+                DS4_RMS_EPS, true);
+    }
+    return ds41_matmul(out, m, projection, in, true) &&
+           ds41_norm(out, out, m, norm_weight);
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
@@ -40274,15 +40305,26 @@ static bool ds41_rope(ds4_gpu_tensor *x, uint32_t heads, uint32_t width,
                               ds4_layer_compress_ratio(il) != 0, inverse);
 }
 
+static bool ds41_rope_bf16_input(ds4_gpu_tensor *x, uint32_t heads,
+                                 uint32_t width, uint32_t il, uint32_t pos,
+                                 bool inverse) {
+    return ds4_gpu_dsv41_rope_bf16_input(x, width, heads, 1, pos,
+        ds4_layer_compress_ratio(il) != 0, inverse);
+}
+
 static bool ds41_hc_mix(ds41_gpu_graph *g, const ds4_model *m,
                         const ds4_layer_weights *l, bool ffn) {
     const ds4_gpu_tensor *residual = ffn ? g->after_attn : g->residual;
     const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
     const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
     const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    return ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
-               DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
-           ds41_matmul(g->mix, m, fn, g->flat_norm, false) &&
+    const bool projected = ds41_fuse_small() && fn->type == DS4_TENSOR_F16 ?
+        ds4_gpu_hc_rms_norm_mix_f16_tensor(g->mix, residual, m->map, m->size,
+            fn->abs_offset, DS4_N_HC * DS4_N_EMBD, 24, DS4_RMS_EPS) != 0 :
+        ds4_gpu_rms_norm_plain_tensor(g->flat_norm, residual,
+            DS4_N_HC * DS4_N_EMBD, DS4_RMS_EPS) &&
+            ds41_matmul(g->mix, m, fn, g->flat_norm, false);
+    return projected &&
            ds4_gpu_hc_split_sinkhorn_tensor(ffn ? g->ffn_split : g->attn_split,
                g->mix, m->map, m->size, scale->abs_offset, base->abs_offset,
                DS4_N_HC, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
@@ -40325,8 +40367,8 @@ static bool ds41_attention_publish(ds41_gpu_graph *g, const ds4_model *m,
         if ((pos + 1u) % ratio == 0) {
             const uint32_t rope_pos = pos + 1u - ratio;
             if (!ds41_norm(g->latent, g->latent, m, l->attn_compressor_norm) ||
-                !ds41_matmul(g->index_k, m, l->indexer_attn_k, g->latent, true) ||
-                !ds41_norm(g->index_k, g->index_k, m, l->indexer_k_norm) ||
+                !ds41_matmul_norm(g->index_k, m, l->indexer_attn_k,
+                                  g->latent, l->indexer_k_norm) ||
                 !ds41_rope(g->index_k, 1, DS4_N_INDEXER_HEAD_DIM, il, rope_pos, false) ||
                 !ds4_gpu_dsv41_quantize(g->index_k, 128, 1, DS4_V41_FP4_E8M0) ||
                 !ds4_gpu_tensor_copy(g->index_cache[owner], (uint64_t)(n_comp - 1u) * 128u * 4u,
@@ -40369,8 +40411,12 @@ static bool ds41_attention_select_published(ds41_gpu_graph *g, const ds4_model *
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     if (n_comp && ds41_index_source(il)) {
-        if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, true) ||
-            !ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128, il, pos, false) ||
+        const bool fused = ds41_fuse_small();
+        if (!ds41_matmul(g->index_q, m, l->indexer_attn_q_b, g->qr, !fused) ||
+            !(fused ? ds41_rope_bf16_input(g->index_q, DS4_N_INDEXER_HEAD,
+                                           128, il, pos, false) :
+                       ds41_rope(g->index_q, DS4_N_INDEXER_HEAD, 128,
+                                 il, pos, false)) ||
             !ds4_gpu_dsv41_quantize(g->index_q, 128, DS4_N_INDEXER_HEAD, DS4_V41_FP4_E8M0) ||
             !ds41_matmul(g->index_weights, m, l->indexer_proj, g->norm, true) ||
             !ds4_gpu_glm_indexer_score_one_tensor(g->index_scores, g->index_q, g->index_weights,
@@ -40392,12 +40438,16 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t heads = DS4_N_HEAD / g->tp_world;
     const uint32_t head0 = g->tp_rank * heads;
-    if (!projected && (!ds41_matmul(g->qr, m, l->attn_q_a, g->norm, true) ||
-        !ds41_norm(g->qr, g->qr, m, l->attn_q_a_norm) ||
-        !ds41_matmul_rows(g->q, m, l->attn_q_b, g->qr, head0 * 512u, heads * 512u) ||
-        !ds41_matmul(g->kv, m, l->attn_kv, g->norm, true) ||
-        !ds41_norm(g->kv, g->kv, m, l->attn_kv_a_norm))) return false;
-    if (!ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false) ||
+    const bool fused = ds41_fuse_small();
+    if (!projected && (!ds41_matmul_norm(g->qr, m, l->attn_q_a,
+                                        g->norm, l->attn_q_a_norm) ||
+        !ds41_matmul_rows_round(g->q, m, l->attn_q_b, g->qr,
+                               head0 * 512u, heads * 512u, !fused) ||
+        !ds41_matmul_norm(g->kv, m, l->attn_kv,
+                          g->norm, l->attn_kv_a_norm))) return false;
+    if (!(fused ? ds41_rope_bf16_input(g->q, heads, DS4_N_HEAD_DIM,
+                                       il, pos, false) :
+                  ds41_rope(g->q, heads, DS4_N_HEAD_DIM, il, pos, false)) ||
         !ds41_rope(g->kv, 1, DS4_N_HEAD_DIM, il, pos, false) ||
         !ds4_gpu_dsv41_quantize(g->kv, DS4_N_HEAD_DIM, 1, DS4_V41_FP8_E8M0) ||
         !ds4_gpu_tensor_copy(g->window[il], (uint64_t)(pos % 128u) * 512u * 4u,
@@ -40412,8 +40462,11 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
             g->q, g->window[il], n_raw, 128, (pos + 1u - n_raw) % 128u,
             g->selected_kv, 0, attended, NULL, 0,
             heads, DS4_N_HEAD_DIM) ||
-        !ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) ||
-        !ds41_rope(g->heads, heads, DS4_N_HEAD_DIM, il, pos, true)) return false;
+        !(fused ? ds41_rope_bf16_input(g->heads, heads, DS4_N_HEAD_DIM,
+                                       il, pos, true) :
+                  ds41_bf16(g->heads, heads * DS4_N_HEAD_DIM) &&
+                      ds41_rope(g->heads, heads, DS4_N_HEAD_DIM,
+                                il, pos, true))) return false;
     if (projected) return true;
     return ds41_attention_output(g, m, l) &&
            ds41_sum_partial(g, g->block, il, DS4_TP_GATE_ATTN) &&
@@ -40435,13 +40488,19 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
-    if ((!shared_owner || g->tp_rank == (il & 1u)) &&
-        (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, true) ||
-        !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, true) ||
-        !ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
-                              DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-        !ds41_bf16(g->shared_mid, DS4_N_FF_EXP) ||
-        !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid, true))) return false;
+    if (!shared_owner || g->tp_rank == (il & 1u)) {
+        const bool fused_swiglu = ds41_fuse_small();
+        if (!ds41_matmul(g->shared_gate, m, l->ffn_gate_shexp, g->norm, !fused_swiglu) ||
+            !ds41_matmul(g->shared_up, m, l->ffn_up_shexp, g->norm, !fused_swiglu) ||
+            !(fused_swiglu ?
+              ds4_gpu_dsv41_swiglu_bf16(g->shared_mid, g->shared_gate,
+                  g->shared_up, DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP) :
+              ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
+                  DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+                  ds41_bf16(g->shared_mid, DS4_N_FF_EXP)) ||
+            !ds41_matmul(g->shared, m, l->ffn_down_shexp, g->shared_mid,
+                         shared_owner || !ds41_fuse_small())) return false;
+    }
     if (!ds4_gpu_routed_moe_one_tensor(routed, g->gate, g->up, g->mid, g->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
@@ -40454,16 +40513,24 @@ static bool ds41_moe(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_owner && g->tp_rank == (il & 1u) &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
     if (!ds41_sum_partial(g, routed, il, DS4_TP_GATE_FFN)) return false;
+    if (!shared_owner && ds41_fuse_small()) {
+        return ds4_gpu_dsv41_add_bf16(g->block, routed, g->shared, DS4_N_EMBD) != 0;
+    }
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
-        ds41_bf16(g->block, DS4_N_EMBD);
+           ds41_bf16(g->block, DS4_N_EMBD);
 }
 
 static bool ds41_graph_logits(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_weights *w, float *logits) {
     if (!g->valid || !logits || !ds4_gpu_begin_commands()) return false;
-    bool ok = ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-              ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm) &&
-              ds41_matmul(g->logits, m, w->output, g->norm, false);
+    const ds4_gpu_tensor *pre = ds41_fuse_small() ? g->ffn_split : g->pre;
+    bool ok = ds41_fuse_small() ?
+        ds4_gpu_dsv41_hc_weighted_sum_norm_bf16(g->x, g->norm,
+            g->residual, pre, m->map, m->size, w->output_norm->abs_offset,
+            DS4_N_EMBD, DS4_RMS_EPS) != 0 :
+        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+            ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, w->output_norm);
+    ok = ok && ds41_matmul(g->logits, m, w->output, g->norm, false);
     if (!ds4_gpu_end_commands()) ok = false;
     return ok && ds4_gpu_tensor_read(g->logits, 0, logits,
                                      (uint64_t)DS4_N_VOCAB * sizeof(float));
@@ -40478,18 +40545,35 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
     }
-    return ds41_hc_mix(g, m, l, false) &&
-        ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
+    if (!ds41_hc_mix(g, m, l, false)) return false;
+    if (ds41_fuse_small()) {
+        const ds4_gpu_tensor *pre = il ? g->ffn_split : g->pre;
+        return ds4_gpu_dsv41_hc_weighted_sum_norm_bf16(g->x, g->norm,
+            g->residual, pre, m->map, m->size, l->attn_norm->abs_offset,
+            DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    }
+    return ds4_gpu_hc_weighted_sum_tensor(g->x, g->residual, g->pre, DS4_N_EMBD, DS4_N_HC) &&
+           ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
 static bool ds41_graph_after_attention(ds41_gpu_graph *g, const ds4_model *m,
                                       const ds4_layer_weights *l) {
-    return ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC) &&
-        ds41_hc_mix(g, m, l, true) &&
-        ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn, g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
+    const bool fused = ds41_fuse_small();
+    if (!(fused ?
+          ds4_gpu_dsv41_hc_expand_split_bf16_tensor(g->after_attn, g->block,
+              g->residual, g->attn_split, DS4_N_EMBD, DS4_N_HC) :
+          ds4_gpu_hc_expand_split_tensor(g->after_attn, g->block, g->residual,
+              g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+              ds41_bf16(g->after_attn, DS4_N_EMBD * DS4_N_HC))) return false;
+    if (!ds41_hc_mix(g, m, l, true)) return false;
+    if (fused) {
+        return ds4_gpu_dsv41_hc_weighted_sum_norm_bf16(g->x, g->norm,
+            g->after_attn, g->attn_split, m->map, m->size,
+            l->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) != 0;
+    }
+    return ds4_gpu_hc_weighted_sum_split_tensor(g->x, g->after_attn,
+               g->attn_split, DS4_N_EMBD, DS4_N_HC) &&
+           ds41_bf16(g->x, DS4_N_EMBD) && ds41_norm(g->norm, g->x, m, l->ffn_norm);
 }
 
 static bool ds41_graph_before_moe(ds41_gpu_graph *g, const ds4_model *m,
@@ -40763,9 +40847,15 @@ static bool ds41_attention_batch(ds41_gpu_graph *g, const ds4_model *m,
 }
 
 static bool ds41_graph_after_moe(ds41_gpu_graph *g) {
-    return ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
-        ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC) &&
-        ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0, DS4_N_HC * sizeof(float));
+    const bool expanded = ds41_fuse_small() ?
+        ds4_gpu_dsv41_hc_expand_split_bf16_tensor(g->residual, g->block,
+            g->after_attn, g->ffn_split, DS4_N_EMBD, DS4_N_HC) :
+        ds4_gpu_hc_expand_split_tensor(g->residual, g->block, g->after_attn,
+            g->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+            ds41_bf16(g->residual, DS4_N_EMBD * DS4_N_HC);
+    return expanded && (ds41_fuse_small() ||
+        ds4_gpu_tensor_copy(g->pre, 0, g->ffn_split, 0,
+                            DS4_N_HC * sizeof(float)));
 }
 
 static bool ds41_graph_layer(ds41_gpu_graph *g, const ds4_model *m,
