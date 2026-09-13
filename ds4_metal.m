@@ -735,6 +735,20 @@ static double g_stream_expert_timing_selected_read_ms;
 static double g_stream_expert_timing_selected_sync_ms;
 static double g_stream_expert_timing_selected_copy_ms;
 static double g_stream_expert_timing_selected_bind_ms;
+static uint64_t g_stream_expert_timing_cpu_gap_calls;
+static double g_stream_expert_timing_cpu_gap_ms;
+static double g_stream_expert_timing_cpu_wake_ms;
+static double g_stream_expert_timing_cpu_copy_ms;
+static double g_stream_expert_timing_cpu_lookup_ms;
+static double g_stream_expert_timing_cpu_prepare_ms;
+static double g_stream_expert_timing_cpu_encode_submit_ms;
+static bool g_stream_expert_timing_cpu_gap_active;
+static double g_stream_expert_timing_cpu_gap_start_ms;
+static double g_stream_expert_timing_cpu_gap_copy_ms;
+static double g_stream_expert_timing_cpu_gap_lookup_ms;
+static double g_stream_expert_timing_cpu_gap_prepare_ms;
+static double g_stream_expert_timing_cpu_gap_wake_ms;
+static __thread double g_stream_expert_timing_last_wait_wake_ms;
 static uint64_t g_stream_expert_timing_split_layers;
 static uint64_t g_stream_expert_timing_split_resident_experts;
 static uint64_t g_stream_expert_timing_split_missing_experts;
@@ -773,6 +787,13 @@ typedef struct {
     double selected_sync_ms;
     double selected_copy_ms;
     double selected_bind_ms;
+    uint64_t cpu_gap_calls;
+    double cpu_gap_ms;
+    double cpu_wake_ms;
+    double cpu_copy_ms;
+    double cpu_lookup_ms;
+    double cpu_prepare_ms;
+    double cpu_encode_submit_ms;
     uint64_t split_layers;
     uint64_t split_resident_experts;
     uint64_t split_missing_experts;
@@ -830,6 +851,8 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
 static int ds4_gpu_stream_expert_timing_summary_enabled(void);
+static void ds4_gpu_stream_expert_timing_note_next_commit(void);
+static double ds4_gpu_now_ms(void);
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       layer,
         uint32_t       expert,
@@ -1461,7 +1484,7 @@ static void ds4_gpu_time_profile_print_one(
         uint64_t                          decode_tokens) {
     const double gpu_avg_ms = stats.gpu_time_samples ?
         stats.gpu_busy_seconds * 1.0e3 / (double)stats.gpu_time_samples : 0.0;
-    const double kernel_avg_ms = stats.kernel_time_samples ?
+    const double driver_schedule_avg_ms = stats.kernel_time_samples ?
         stats.kernel_seconds * 1.0e3 / (double)stats.kernel_time_samples : 0.0;
     const double commit_avg_ms = stats.commit_to_start_samples ?
         stats.commit_to_start_seconds * 1.0e3 /
@@ -1474,10 +1497,10 @@ static void ds4_gpu_time_profile_print_one(
         wall_seconds - stats.gpu_busy_seconds : 0.0;
     fprintf(stderr,
             "ds4:   gpu time profile %s: decode_tokens=%llu "
-            "command_buffers=%llu gpu_samples=%llu kernel_samples=%llu "
+            "command_buffers=%llu gpu_samples=%llu driver_schedule_samples=%llu "
             "commit_to_start_samples=%llu "
             "gpu_busy_total=%.3f ms gpu_busy_avg=%.3f ms "
-            "kernel_total=%.3f ms kernel_avg=%.3f ms "
+            "driver_schedule_total=%.3f ms driver_schedule_avg=%.3f ms "
             "commit_to_start_total=%.3f ms commit_to_start_avg=%.3f ms "
             "wall=%.3f ms "
             "gpu_idle_estimate=%.3f ms busy/wall=%.1f%%\n",
@@ -1490,7 +1513,7 @@ static void ds4_gpu_time_profile_print_one(
             stats.gpu_busy_seconds * 1.0e3,
             gpu_avg_ms,
             stats.kernel_seconds * 1.0e3,
-            kernel_avg_ms,
+            driver_schedule_avg_ms,
             stats.commit_to_start_seconds * 1.0e3,
             commit_avg_ms,
             wall_seconds * 1.0e3,
@@ -1529,6 +1552,15 @@ static void ds4_gpu_invalidate_completion_counters(void) {
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
+    if (ds4_gpu_stream_expert_timing_summary_enabled()) {
+        mach_timebase_info_data_t timebase;
+        (void)mach_timebase_info(&timebase);
+        const double now_ms = (double)mach_absolute_time() *
+            (double)timebase.numer / (double)timebase.denom * 1.0e-6;
+        const double wake_ms = now_ms - cb.GPUEndTime * 1.0e3;
+        g_stream_expert_timing_last_wait_wake_ms =
+            wake_ms > 0.0 ? wake_ms : 0.0;
+    }
     if (getenv("DS4_METAL_CB_TIMES")) {
         static double prev_gpu_end;
         static uint64_t n_printed;
@@ -4081,6 +4113,13 @@ ds4_gpu_stream_expert_timing_current(void) {
         .selected_sync_ms = g_stream_expert_timing_selected_sync_ms,
         .selected_copy_ms = g_stream_expert_timing_selected_copy_ms,
         .selected_bind_ms = g_stream_expert_timing_selected_bind_ms,
+        .cpu_gap_calls = g_stream_expert_timing_cpu_gap_calls,
+        .cpu_gap_ms = g_stream_expert_timing_cpu_gap_ms,
+        .cpu_wake_ms = g_stream_expert_timing_cpu_wake_ms,
+        .cpu_copy_ms = g_stream_expert_timing_cpu_copy_ms,
+        .cpu_lookup_ms = g_stream_expert_timing_cpu_lookup_ms,
+        .cpu_prepare_ms = g_stream_expert_timing_cpu_prepare_ms,
+        .cpu_encode_submit_ms = g_stream_expert_timing_cpu_encode_submit_ms,
         .split_layers = g_stream_expert_timing_split_layers,
         .split_resident_experts = g_stream_expert_timing_split_resident_experts,
         .split_missing_experts = g_stream_expert_timing_split_missing_experts,
@@ -4170,6 +4209,28 @@ ds4_gpu_stream_expert_timing_delta(
         .selected_bind_ms =
             ds4_gpu_stream_expert_timing_delta_f64(current.selected_bind_ms,
                                                    previous.selected_bind_ms),
+        .cpu_gap_calls =
+            ds4_gpu_stream_expert_timing_delta_u64(current.cpu_gap_calls,
+                                                   previous.cpu_gap_calls),
+        .cpu_gap_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(current.cpu_gap_ms,
+                                                   previous.cpu_gap_ms),
+        .cpu_wake_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(current.cpu_wake_ms,
+                                                   previous.cpu_wake_ms),
+        .cpu_copy_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(current.cpu_copy_ms,
+                                                   previous.cpu_copy_ms),
+        .cpu_lookup_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(current.cpu_lookup_ms,
+                                                   previous.cpu_lookup_ms),
+        .cpu_prepare_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(current.cpu_prepare_ms,
+                                                   previous.cpu_prepare_ms),
+        .cpu_encode_submit_ms =
+            ds4_gpu_stream_expert_timing_delta_f64(
+                    current.cpu_encode_submit_ms,
+                    previous.cpu_encode_submit_ms),
         .split_layers =
             ds4_gpu_stream_expert_timing_delta_u64(current.split_layers,
                                                    previous.split_layers),
@@ -4315,6 +4376,19 @@ static void ds4_gpu_stream_expert_timing_print(
         selected_calls != 0.0 ? s.selected_copy_ms / selected_calls : 0.0;
     const double selected_bind_avg =
         selected_calls != 0.0 ? s.selected_bind_ms / selected_calls : 0.0;
+    const double cpu_gap_calls = (double)s.cpu_gap_calls;
+    const double cpu_gap_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_gap_ms / cpu_gap_calls : 0.0;
+    const double cpu_wake_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_wake_ms / cpu_gap_calls : 0.0;
+    const double cpu_copy_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_copy_ms / cpu_gap_calls : 0.0;
+    const double cpu_lookup_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_lookup_ms / cpu_gap_calls : 0.0;
+    const double cpu_prepare_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_prepare_ms / cpu_gap_calls : 0.0;
+    const double cpu_encode_submit_avg = cpu_gap_calls != 0.0 ?
+        s.cpu_encode_submit_ms / cpu_gap_calls : 0.0;
     const double split_resident_avg =
         split_layers != 0.0 ? s.split_resident_ms / split_layers : 0.0;
     const double split_missing_avg =
@@ -4429,6 +4503,29 @@ static void ds4_gpu_stream_expert_timing_print(
             (unsigned long long)s.cache_mixed_layers,
             cache_resident_experts_avg,
             cache_missing_experts_avg);
+    if (s.cpu_gap_calls != 0) {
+        fprintf(stderr,
+                "ds4:   streaming expert cpu gap %s calls=%llu total_avg=%.3f ms "
+                "wake_avg=%.3f ms copy_avg=%.3f ms lookup_hotness_avg=%.3f ms "
+                "miss_prepare_avg=%.3f ms encode_submit_avg=%.3f ms "
+                "total=%.3f ms wake_total=%.3f ms copy_total=%.3f ms "
+                "lookup_hotness_total=%.3f ms miss_prepare_total=%.3f ms "
+                "encode_submit_total=%.3f ms\n",
+                scope ? scope : "total",
+                (unsigned long long)s.cpu_gap_calls,
+                cpu_gap_avg,
+                cpu_wake_avg,
+                cpu_copy_avg,
+                cpu_lookup_avg,
+                cpu_prepare_avg,
+                cpu_encode_submit_avg,
+                s.cpu_gap_ms,
+                s.cpu_wake_ms,
+                s.cpu_copy_ms,
+                s.cpu_lookup_ms,
+                s.cpu_prepare_ms,
+                s.cpu_encode_submit_ms);
+    }
 }
 
 static void ds4_gpu_print_task_memory_report(void) {
@@ -9698,6 +9795,7 @@ int ds4_gpu_flush_commands(void) {
     id<MTLCommandBuffer> cb = g_batch_cb;
     g_batch_cb = nil;
     g_batch_has_work = NO;
+    ds4_gpu_stream_expert_timing_note_next_commit();
     ds4_gpu_commit_command_buffer(cb);
     [g_pending_cbs addObject:cb];
     ds4_gpu_stream_expert_cache_note_batch_committed();
@@ -11649,6 +11747,7 @@ int ds4_gpu_end_commands(void) {
     g_batch_has_work = NO;
     g_stream_expert_cache_owned_seq = g_stream_expert_cache_batch_seq;
     g_stream_expert_cache_batch_seq = 0;
+    ds4_gpu_stream_expert_timing_note_next_commit();
     return ds4_gpu_finish_command_buffer(cb, 1, "command batch");
 }
 
@@ -13309,6 +13408,46 @@ static void ds4_gpu_stream_expert_timing_note_selected(
     g_stream_expert_timing_selected_copy_ms += copy_ms;
     g_stream_expert_timing_selected_read_ms += sync_ms + copy_ms;
     g_stream_expert_timing_selected_bind_ms += bind_ms;
+}
+
+static void ds4_gpu_stream_expert_timing_begin_cpu_gap(
+        double start_ms,
+        double wake_ms,
+        double copy_ms,
+        double lookup_ms,
+        double prepare_ms) {
+    if (!ds4_gpu_stream_expert_timing_summary_enabled() || start_ms == 0.0) return;
+    /* A sample normally ends at the layer-tail commit. If an error path left
+     * one open, replace it instead of merging two selected-ID gaps. */
+    g_stream_expert_timing_cpu_gap_active = true;
+    g_stream_expert_timing_cpu_gap_start_ms = start_ms;
+    g_stream_expert_timing_cpu_gap_wake_ms = wake_ms;
+    g_stream_expert_timing_cpu_gap_copy_ms = copy_ms;
+    g_stream_expert_timing_cpu_gap_lookup_ms = lookup_ms;
+    g_stream_expert_timing_cpu_gap_prepare_ms = prepare_ms;
+}
+
+static void ds4_gpu_stream_expert_timing_note_next_commit(void) {
+    if (!g_stream_expert_timing_cpu_gap_active) return;
+    const double total_ms =
+        ds4_gpu_now_ms() - g_stream_expert_timing_cpu_gap_start_ms;
+    double encode_submit_ms =
+        total_ms - g_stream_expert_timing_cpu_gap_copy_ms -
+        g_stream_expert_timing_cpu_gap_lookup_ms -
+        g_stream_expert_timing_cpu_gap_prepare_ms;
+    if (encode_submit_ms < 0.0) encode_submit_ms = 0.0;
+    g_stream_expert_timing_cpu_gap_calls++;
+    g_stream_expert_timing_cpu_gap_ms += total_ms;
+    g_stream_expert_timing_cpu_wake_ms +=
+        g_stream_expert_timing_cpu_gap_wake_ms;
+    g_stream_expert_timing_cpu_copy_ms +=
+        g_stream_expert_timing_cpu_gap_copy_ms;
+    g_stream_expert_timing_cpu_lookup_ms +=
+        g_stream_expert_timing_cpu_gap_lookup_ms;
+    g_stream_expert_timing_cpu_prepare_ms +=
+        g_stream_expert_timing_cpu_gap_prepare_ms;
+    g_stream_expert_timing_cpu_encode_submit_ms += encode_submit_ms;
+    g_stream_expert_timing_cpu_gap_active = false;
 }
 
 static void ds4_gpu_stream_expert_timing_note_split(
@@ -41503,6 +41642,12 @@ int ds4_gpu_routed_moe_one_tensor(
             double selected_sync_ms = 0.0;
             double selected_copy_ms = 0.0;
             double selected_wrap_ms = 0.0;
+            double selected_cpu_gap_t0 = 0.0;
+            double selected_lookup_t0 = 0.0;
+            double selected_lookup_ms = 0.0;
+            double selected_prepare_t0 = 0.0;
+            double selected_prepare_ms = 0.0;
+            double selected_wake_ms = 0.0;
             uint64_t selected_cache_hits0 = g_stream_expert_cache_hits;
             uint64_t selected_cache_misses0 = g_stream_expert_cache_misses;
             uint64_t selected_cache_wraps0 = g_stream_expert_cache_wraps;
@@ -41652,6 +41797,9 @@ int ds4_gpu_routed_moe_one_tensor(
                         if (selected_timing) {
                             selected_sync_ms +=
                                 ds4_gpu_now_ms() - selected_boundary_t0;
+                            selected_cpu_gap_t0 = ds4_gpu_now_ms();
+                            selected_wake_ms = q4_selected_shared_event ? 0.0 :
+                                g_stream_expert_timing_last_wait_wake_ms;
                         }
                         double selected_copy_t0 =
                             selected_timing ? ds4_gpu_now_ms() : 0.0;
@@ -41695,6 +41843,7 @@ int ds4_gpu_routed_moe_one_tensor(
             if (selected_timing) {
                 selected_read_ms = selected_sync_ms + selected_copy_ms;
                 selected_t0 = ds4_gpu_now_ms();
+                selected_lookup_t0 = selected_t0;
             }
 
             if (selected_ids_available) {
@@ -41829,6 +41978,10 @@ int ds4_gpu_routed_moe_one_tensor(
                         return 0;
                     }
                 }
+            }
+            if (selected_cpu_gap_t0 != 0.0) {
+                selected_lookup_ms = ds4_gpu_now_ms() - selected_lookup_t0;
+                selected_prepare_t0 = ds4_gpu_now_ms();
             }
             if (use_stream_expert_cache) {
                 use_stream_expert_addr_table =
@@ -41971,6 +42124,16 @@ int ds4_gpu_routed_moe_one_tensor(
                 }
             }
             if (selected_timing) {
+                if (selected_cpu_gap_t0 != 0.0) {
+                    selected_prepare_ms =
+                        ds4_gpu_now_ms() - selected_prepare_t0;
+                    ds4_gpu_stream_expert_timing_begin_cpu_gap(
+                            selected_cpu_gap_t0,
+                            selected_wake_ms,
+                            selected_copy_ms,
+                            selected_lookup_ms,
+                            selected_prepare_ms);
+                }
                 selected_wrap_ms = ds4_gpu_now_ms() - selected_t0;
                 if (use_stream_expert_cache) {
                     ds4_gpu_stream_expert_timing_note_cache_class(
