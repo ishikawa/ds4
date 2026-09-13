@@ -476,6 +476,8 @@ static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline;
+static bool g_moe_iq2_kernel_variant_m4;
+static bool g_moe_q2_kernel_variant_m4;
 static id<MTLComputePipelineState> g_moe_stream_expert_cache_validate_pipeline;
 static id<MTLComputePipelineState> g_moe_q4_gather_slots6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_table_q4_k_pair_swiglu_pipeline;
@@ -7783,6 +7785,33 @@ int ds4_gpu_init(void) {
         MTLFunctionConstantValues *moe_mv_id_constants = [[MTLFunctionConstantValues alloc] init];
         int16_t moe_mv_id_nsg = 2;
         [moe_mv_id_constants setConstantValue:&moe_mv_id_nsg type:MTLDataTypeShort atIndex:600];
+        const char *moe_kernel_variant = getenv("DS4_METAL_MOE_KERNEL_VARIANT");
+        g_moe_iq2_kernel_variant_m4 =
+            moe_kernel_variant != NULL &&
+            (strcmp(moe_kernel_variant, "m4") == 0 ||
+             strcmp(moe_kernel_variant, "m4-iq2") == 0);
+        g_moe_q2_kernel_variant_m4 =
+            moe_kernel_variant != NULL &&
+            (strcmp(moe_kernel_variant, "m4") == 0 ||
+             strcmp(moe_kernel_variant, "m4-q2") == 0);
+        MTLFunctionConstantValues *moe_addr_iq2_constants = [[MTLFunctionConstantValues alloc] init];
+        MTLFunctionConstantValues *moe_addr_q2_constants = [[MTLFunctionConstantValues alloc] init];
+        int16_t moe_addr_iq2_nsg = g_moe_iq2_kernel_variant_m4 ? 4 : 2;
+        int16_t moe_addr_q2_nsg = g_moe_q2_kernel_variant_m4 ? 4 : 2;
+        [moe_addr_iq2_constants setConstantValue:&moe_addr_iq2_nsg type:MTLDataTypeShort atIndex:600];
+        [moe_addr_q2_constants setConstantValue:&moe_addr_q2_nsg type:MTLDataTypeShort atIndex:600];
+        NSString *moe_addr_iq2_pair_name = g_moe_iq2_kernel_variant_m4 ?
+            @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32_m4" :
+            @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32";
+        NSString *moe_addr_q2_sum6_name = g_moe_q2_kernel_variant_m4 ?
+            @"kernel_mul_mv_addr_q2_K_sum6_f32_m4" :
+            @"kernel_mul_mv_addr_q2_K_sum6_f32";
+        NSString *moe_addr_iq2_pair_masked_name = g_moe_iq2_kernel_variant_m4 ?
+            @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32_m4" :
+            @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32";
+        NSString *moe_addr_q2_sum6_masked_name = g_moe_q2_kernel_variant_m4 ?
+            @"kernel_mul_mv_addr_q2_K_sum6_masked_f32_m4" :
+            @"kernel_mul_mv_addr_q2_K_sum6_masked_f32";
 
         error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_id_iq2_xxs_f32"
@@ -7960,11 +7989,12 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32"
-                           constantValues:moe_mv_id_constants
+        fn = [library newFunctionWithName:moe_addr_iq2_pair_name
+                           constantValues:moe_addr_iq2_constants
                                     error:&error];
         if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32 function not found: %s\n",
+            fprintf(stderr, "ds4: Metal %s function not found: %s\n",
+                    [moe_addr_iq2_pair_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -7972,7 +8002,8 @@ int ds4_gpu_init(void) {
         }
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_f32 pipeline failed: %s\n",
+            fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
+                    [moe_addr_iq2_pair_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8000,11 +8031,12 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_q2_K_sum6_f32"
-                           constantValues:moe_mv_id_constants
+        fn = [library newFunctionWithName:moe_addr_q2_sum6_name
+                           constantValues:moe_addr_q2_constants
                                     error:&error];
         if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_f32 function not found: %s\n",
+            fprintf(stderr, "ds4: Metal %s function not found: %s\n",
+                    [moe_addr_q2_sum6_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8012,7 +8044,8 @@ int ds4_gpu_init(void) {
         }
         g_moe_mul_mv_addr_q2_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_addr_q2_k_sum6_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_f32 pipeline failed: %s\n",
+            fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
+                    [moe_addr_q2_sum6_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8020,11 +8053,12 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32"
-                           constantValues:moe_mv_id_constants
+        fn = [library newFunctionWithName:moe_addr_iq2_pair_masked_name
+                           constantValues:moe_addr_iq2_constants
                                     error:&error];
         if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32 function not found: %s\n",
+            fprintf(stderr, "ds4: Metal %s function not found: %s\n",
+                    [moe_addr_iq2_pair_masked_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8033,7 +8067,8 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline =
             [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32 pipeline failed: %s\n",
+            fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
+                    [moe_addr_iq2_pair_masked_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8041,11 +8076,12 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_q2_K_sum6_masked_f32"
-                           constantValues:moe_mv_id_constants
+        fn = [library newFunctionWithName:moe_addr_q2_sum6_masked_name
+                           constantValues:moe_addr_q2_constants
                                     error:&error];
         if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_masked_f32 function not found: %s\n",
+            fprintf(stderr, "ds4: Metal %s function not found: %s\n",
+                    [moe_addr_q2_sum6_masked_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -8054,7 +8090,8 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline =
             [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_addr_q2_K_sum6_masked_f32 pipeline failed: %s\n",
+            fprintf(stderr, "ds4: Metal %s pipeline failed: %s\n",
+                    [moe_addr_q2_sum6_masked_name UTF8String],
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -32662,6 +32699,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(
         return 0;
     }
 
+    if (g_moe_iq2_kernel_variant_m4) {
+        nsg = 4;
+        threadgroup_bytes = 0;
+    }
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
@@ -32794,6 +32835,10 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6(
         return 0;
     }
 
+    if (g_moe_q2_kernel_variant_m4) {
+        nsg = 4;
+        threadgroup_bytes = 0;
+    }
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 
@@ -32858,6 +32903,10 @@ static int ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
         return 0;
     }
 
+    if (g_moe_iq2_kernel_variant_m4) {
+        nsg = 4;
+        threadgroup_bytes = 0;
+    }
     const NSUInteger nr0 = (NSUInteger)args->nr0;
     const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
@@ -32921,6 +32970,10 @@ static int ds4_gpu_encode_mul_mv_addr_q2_sum6_masked(
         return 0;
     }
 
+    if (g_moe_q2_kernel_variant_m4) {
+        nsg = 4;
+        threadgroup_bytes = 0;
+    }
     const NSUInteger rows_per_group = (NSUInteger)args->nr0 * nsg;
     const NSUInteger row_groups = ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
 
