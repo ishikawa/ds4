@@ -39851,6 +39851,23 @@ typedef struct {
 #undef DS41_ROW_FIELD
 } ds41_prefill_row;
 
+enum {
+    DS41_M3_TIMING_Q8_HEAD = 0,
+    DS41_M3_TIMING_F16,
+    DS41_M3_TIMING_ATTENTION,
+    DS41_M3_TIMING_SHARED,
+    DS41_M3_TIMING_ROUTER,
+    DS41_M3_TIMING_GROUP_COUNT,
+};
+
+typedef struct {
+    uint64_t reference_command_buffers;
+    uint64_t candidate_command_buffers;
+    uint64_t calls;
+    double reference_gpu_ms;
+    double candidate_gpu_ms;
+} ds41_dense_m3_timing_stats;
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
         (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
@@ -39937,6 +39954,10 @@ typedef struct {
     ds4_gpu_tensor *spec_state_prefix1;
     ds4_gpu_tensor *spec_state_prefix2;
     uint64_t dense_m3_dispatches;
+    uint64_t dense_m3_timing_cycle;
+    bool dense_m3_timing_reverse;
+    ds41_dense_m3_timing_stats
+        dense_m3_timing_groups[DS41_M3_TIMING_GROUP_COUNT];
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -40038,6 +40059,155 @@ static bool ds41_dense_m3_profile_requested(void) {
         !ds41_dense_m3_diagnostic_requested();
 }
 
+static bool ds41_dense_m3_diagnostic_timing_requested(void) {
+    const char *v = getenv("DS4_METAL_V41_VERIFY_DENSE_M3_DIAGNOSTIC_TIMING");
+    return ds41_dense_m3_diagnostic_requested() && v && !strcmp(v, "1");
+}
+
+static int ds41_dense_m3_timing_group_index(const char *producer) {
+    if (!producer) return -1;
+    if (!strcmp(producer, "output_head")) return DS41_M3_TIMING_Q8_HEAD;
+    if (!strcmp(producer, "router_logits")) return DS41_M3_TIMING_ROUTER;
+    if (!strcmp(producer, "attention_output")) return DS41_M3_TIMING_ATTENTION;
+    if (!strncmp(producer, "shared_", sizeof("shared_") - 1))
+        return DS41_M3_TIMING_SHARED;
+    if (!strncmp(producer, "attn_", sizeof("attn_") - 1))
+        return DS41_M3_TIMING_F16;
+    return -1;
+}
+
+static void ds41_dense_m3_timing_record(
+        ds41_gpu_graph *g, const char *producer, bool candidate,
+        double gpu_ms, uint64_t command_buffers) {
+    const int group = ds41_dense_m3_timing_group_index(producer);
+    if (g && group >= 0 && group < DS41_M3_TIMING_GROUP_COUNT) {
+        ds41_dense_m3_timing_stats *stats = &g->dense_m3_timing_groups[group];
+        stats->calls++;
+        if (candidate) {
+            stats->candidate_gpu_ms += gpu_ms;
+            stats->candidate_command_buffers += command_buffers;
+        } else {
+            stats->reference_gpu_ms += gpu_ms;
+            stats->reference_command_buffers += command_buffers;
+        }
+    }
+    fprintf(stderr,
+            "ds4: V4.1 dense_m3 diagnostic timing cycle=%llu producer=%s "
+            "path=%s command_buffers=%llu gpu_ms=%.3f\n",
+            (unsigned long long)(g ? g->dense_m3_timing_cycle - 1u : 0u),
+            producer ? producer : "unknown", candidate ? "candidate" : "reference",
+            (unsigned long long)command_buffers, gpu_ms);
+}
+
+static bool ds41_matmul_verify_batch_core(ds4_gpu_tensor *out,
+                                          const ds4_model *m,
+                                          const ds4_tensor *weight,
+                                          const ds4_gpu_tensor *in,
+                                          uint32_t rows, bool round);
+
+static bool ds41_matmul_rows_legacy(ds4_gpu_tensor *out, const ds4_model *m,
+                                    const ds4_tensor *weight,
+                                    const ds4_gpu_tensor *in, uint32_t rows,
+                                    bool round);
+
+static bool ds41_dense_m3_timing_path_end(
+        double before_ms, uint64_t before_command_buffers,
+        bool path_ok, double *gpu_ms, uint64_t *command_buffers) {
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) path_ok = false;
+    double after_ms = 0.0;
+    uint64_t after_command_buffers = 0;
+    if (!ds4_gpu_dense_m3_timing_snapshot(&after_ms, &after_command_buffers))
+        path_ok = false;
+    if (after_ms < before_ms || after_command_buffers < before_command_buffers) {
+        path_ok = false;
+        after_ms = before_ms;
+        after_command_buffers = before_command_buffers;
+    }
+    if (gpu_ms) *gpu_ms = after_ms - before_ms;
+    if (command_buffers) *command_buffers = after_command_buffers - before_command_buffers;
+    return path_ok;
+}
+
+static bool ds41_dense_m3_timing_matmul_path(
+        ds4_gpu_tensor *legacy, ds4_gpu_tensor *candidate,
+        const ds4_model *m, const ds4_tensor *weight,
+        const ds4_gpu_tensor *in, uint32_t rows, bool round,
+        bool run_candidate, double *gpu_ms, uint64_t *command_buffers) {
+    double before_ms = 0.0;
+    uint64_t before_command_buffers = 0;
+    if (!ds4_gpu_dense_m3_timing_snapshot(&before_ms, &before_command_buffers))
+        return false;
+    const bool path_ok = run_candidate ?
+        ds41_matmul_verify_batch_core(candidate, m, weight, in, rows, round) :
+        ds41_matmul_rows_legacy(legacy, m, weight, in, rows, round);
+    return ds41_dense_m3_timing_path_end(
+        before_ms, before_command_buffers, path_ok,
+        gpu_ms, command_buffers);
+}
+
+static const char *ds41_dense_m3_timing_group_name(int group) {
+    static const char *const names[DS41_M3_TIMING_GROUP_COUNT] = {
+        "q8_head", "f16", "attention_projection", "shared", "router"
+    };
+    return group >= 0 && group < DS41_M3_TIMING_GROUP_COUNT ? names[group] : "unknown";
+}
+
+static void ds41_dense_m3_timing_print_summary(
+        const ds41_gpu_graph *g, double diagnostic_gpu_ms,
+        uint64_t diagnostic_command_buffers, bool valid) {
+    double reference_producer_ms = 0.0;
+    double candidate_producer_ms = 0.0;
+    uint64_t reference_command_buffers = 0;
+    uint64_t candidate_command_buffers = 0;
+    for (int i = 0; i < DS41_M3_TIMING_GROUP_COUNT; i++) {
+        reference_producer_ms += g->dense_m3_timing_groups[i].reference_gpu_ms;
+        candidate_producer_ms += g->dense_m3_timing_groups[i].candidate_gpu_ms;
+        reference_command_buffers +=
+            g->dense_m3_timing_groups[i].reference_command_buffers;
+        candidate_command_buffers +=
+            g->dense_m3_timing_groups[i].candidate_command_buffers;
+    }
+    const double common_gpu_ms = diagnostic_gpu_ms -
+        reference_producer_ms - candidate_producer_ms;
+    const bool nonnegative_common = common_gpu_ms >= -0.001;
+    const double common = nonnegative_common ? common_gpu_ms : 0.0;
+    const double reference_full_ms = common + reference_producer_ms;
+    const double candidate_full_ms = common + candidate_producer_ms;
+    const double ratio = candidate_full_ms > 0.0 ?
+        reference_full_ms / candidate_full_ms : 0.0;
+    fprintf(stderr,
+            "ds4: V4.1 dense_m3 diagnostic timing full_pass cycle=%llu valid=%s "
+            "diagnostic_command_buffers=%llu diagnostic_gpu_ms=%.3f "
+            "common_gpu_ms=%.3f reference_full_gpu_ms=%.3f "
+            "candidate_full_gpu_ms=%.3f R_kernel=%.6f "
+            "reference_producer_gpu_ms=%.3f candidate_producer_gpu_ms=%.3f "
+            "reference_producer_command_buffers=%llu "
+            "candidate_producer_command_buffers=%llu\n",
+            (unsigned long long)(g->dense_m3_timing_cycle - 1u),
+            valid && nonnegative_common && ratio > 0.0 ? "yes" : "no",
+            (unsigned long long)diagnostic_command_buffers,
+            diagnostic_gpu_ms, common, reference_full_ms, candidate_full_ms,
+            ratio, reference_producer_ms, candidate_producer_ms,
+            (unsigned long long)reference_command_buffers,
+            (unsigned long long)candidate_command_buffers);
+    for (int i = 0; i < DS41_M3_TIMING_GROUP_COUNT; i++) {
+        const ds41_dense_m3_timing_stats *stats =
+            &g->dense_m3_timing_groups[i];
+        const double group_ratio = stats->candidate_gpu_ms > 0.0 ?
+            stats->reference_gpu_ms / stats->candidate_gpu_ms : 0.0;
+        fprintf(stderr,
+                "ds4: V4.1 dense_m3 diagnostic timing producer_group=%s "
+                "path_samples=%llu reference_gpu_ms=%.3f candidate_gpu_ms=%.3f "
+                "R_kernel=%.6f reference_command_buffers=%llu "
+                "candidate_command_buffers=%llu\n",
+                ds41_dense_m3_timing_group_name(i),
+                (unsigned long long)stats->calls,
+                stats->reference_gpu_ms, stats->candidate_gpu_ms, group_ratio,
+                (unsigned long long)stats->reference_command_buffers,
+                (unsigned long long)stats->candidate_command_buffers);
+    }
+}
+
 static bool ds41_dspark_spec_test_verifier_error_requested(void) {
     const char *v = getenv("DS4_V41_DSPARK_SPEC_TEST_VERIFIER_ERROR");
     return v && !strcmp(v, "1");
@@ -40112,6 +40282,9 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->valid = true;
     g->dspark_capture_pos = 0;
     g->dspark_capture_committed_generation = 0;
+    g->dense_m3_timing_cycle = 0;
+    g->dense_m3_timing_reverse = false;
+    memset(g->dense_m3_timing_groups, 0, sizeof(g->dense_m3_timing_groups));
     if (g->dspark) {
         metal_graph_dspark_capture_invalidate(g->dspark);
         metal_graph_dspark_cache_reset(g->dspark);
@@ -40366,6 +40539,62 @@ static bool ds41_matmul_verify_batch(ds41_gpu_graph *g,
         !ds41_dense_m3_requested() || !supported) {
         return weight && in && rows == DS41_SPEC_ROWS ?
             ds41_matmul_rows_legacy(out, m, weight, in, rows, round) : false;
+    }
+
+    if (ds41_dense_m3_diagnostic_timing_requested()) {
+        const uint64_t bytes = (uint64_t)rows * (uint64_t)weight->dim[1] * sizeof(float);
+        ds4_gpu_tensor *legacy = ds4_gpu_tensor_alloc(bytes);
+        float *legacy_host = bytes ? malloc((size_t)bytes) : NULL;
+        float *dense_host = bytes ? malloc((size_t)bytes) : NULL;
+        const bool had_batch = ds4_gpu_commands_active();
+        bool ok = legacy && legacy_host && dense_host;
+        if (ok && had_batch) ok = ds4_gpu_end_commands() != 0;
+
+        bool reference_ok = false;
+        bool candidate_ok = false;
+        double reference_ms = 0.0, candidate_ms = 0.0;
+        uint64_t reference_command_buffers = 0, candidate_command_buffers = 0;
+        if (ok) {
+            if (g->dense_m3_timing_reverse) {
+                candidate_ok = ds41_dense_m3_timing_matmul_path(
+                    legacy, out, m, weight, in, rows, round, true,
+                    &candidate_ms, &candidate_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, producer, true, candidate_ms, candidate_command_buffers);
+                reference_ok = ds41_dense_m3_timing_matmul_path(
+                    legacy, out, m, weight, in, rows, round, false,
+                    &reference_ms, &reference_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, producer, false, reference_ms, reference_command_buffers);
+            } else {
+                reference_ok = ds41_dense_m3_timing_matmul_path(
+                    legacy, out, m, weight, in, rows, round, false,
+                    &reference_ms, &reference_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, producer, false, reference_ms, reference_command_buffers);
+                candidate_ok = ds41_dense_m3_timing_matmul_path(
+                    legacy, out, m, weight, in, rows, round, true,
+                    &candidate_ms, &candidate_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, producer, true, candidate_ms, candidate_command_buffers);
+            }
+        }
+        ok = ok && reference_ok && candidate_ok;
+        if (ok) ok = ds4_gpu_tensor_read(legacy, 0, legacy_host, bytes) != 0 &&
+                       ds4_gpu_tensor_read(out, 0, dense_host, bytes) != 0;
+        const bool equal = ok && memcmp(legacy_host, dense_host, (size_t)bytes) == 0;
+        fprintf(stderr,
+                "ds4: V4.1 dense_m3 diagnostic timing producer=%s "
+                "reference_gpu_ms=%.3f candidate_gpu_ms=%.3f memcmp=%s\n",
+                producer ? producer : "unknown", reference_ms, candidate_ms,
+                equal ? "PASS" : "FAIL");
+        if (!equal) ok = false;
+        if (had_batch && ds4_gpu_begin_commands() == 0) ok = false;
+        free(dense_host);
+        free(legacy_host);
+        ds4_gpu_tensor_free(legacy);
+        if (ok) g->dense_m3_dispatches++;
+        return ok;
     }
 
     if (!ds41_dense_m3_diagnostic_requested()) {
@@ -40914,12 +41143,130 @@ static bool ds41_moe_shared_verify_batch(ds41_gpu_graph *g,
                                     shared_owner || !fused, "shared_down");
 }
 
+static void ds41_spec_bind_row(ds41_gpu_graph *view, ds41_gpu_graph *g,
+                               uint32_t row, uint32_t pos);
+
 static bool ds41_attention_output_verify_batch(ds41_gpu_graph *g,
                                                const ds4_model *m,
                                                const ds4_layer_weights *l) {
     if (g->tp_world != 1 || l->attn_output_a->type != DS4_TENSOR_Q8_0 ||
         l->attn_output_b->type != DS4_TENSOR_Q8_0) return false;
     const uint64_t out_bytes = (uint64_t)DS41_SPEC_ROWS * DS4_N_EMBD * sizeof(float);
+    if (ds41_dense_m3_diagnostic_timing_requested()) {
+        const uint32_t low_width = DS4_N_OUT_GROUP * DS4_N_LORA_O;
+        ds4_gpu_tensor *legacy = ds4_gpu_tensor_alloc(out_bytes);
+        ds4_gpu_tensor *legacy_low = ds4_gpu_tensor_alloc(
+            (uint64_t)low_width * sizeof(float));
+        float *legacy_host = out_bytes ? malloc((size_t)out_bytes) : NULL;
+        float *dense_host = out_bytes ? malloc((size_t)out_bytes) : NULL;
+        const bool had_batch = ds4_gpu_commands_active();
+        bool ok = legacy && legacy_low && legacy_host && dense_host;
+        if (ok && had_batch) ok = ds4_gpu_end_commands() != 0;
+
+        bool reference_ok = false;
+        bool candidate_ok = false;
+        double reference_ms = 0.0, candidate_ms = 0.0;
+        uint64_t reference_command_buffers = 0, candidate_command_buffers = 0;
+        if (ok) {
+            if (g->dense_m3_timing_reverse) {
+                double before_ms = 0.0;
+                uint64_t before_command_buffers = 0;
+                candidate_ok = ds4_gpu_dense_m3_timing_snapshot(
+                    &before_ms, &before_command_buffers);
+                if (candidate_ok) candidate_ok =
+                    ds4_gpu_dsv41_attention_output_batch(
+                        g->batch.block, g->batch.low, m->map, m->size,
+                        l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+                        g->batch.heads, DS41_SPEC_ROWS) != 0 &&
+                    ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD,
+                                           DS41_SPEC_ROWS, DS4_V41_BF16) != 0;
+                candidate_ok = ds41_dense_m3_timing_path_end(
+                    before_ms, before_command_buffers, candidate_ok,
+                    &candidate_ms, &candidate_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, "attention_output", true, candidate_ms,
+                    candidate_command_buffers);
+
+                before_ms = 0.0;
+                before_command_buffers = 0;
+                reference_ok = ds4_gpu_dense_m3_timing_snapshot(
+                    &before_ms, &before_command_buffers);
+                for (uint32_t row = 0; reference_ok && row < DS41_SPEC_ROWS; row++) {
+                    ds41_gpu_graph view = *g;
+                    ds41_spec_bind_row(&view, g, row, g->pos + row);
+                    view.low = legacy_low;
+                    view.block = ds4_gpu_tensor_view(legacy,
+                        (uint64_t)row * DS4_N_EMBD * sizeof(float),
+                        (uint64_t)DS4_N_EMBD * sizeof(float));
+                    reference_ok = view.block && ds41_attention_output(&view, m, l) &&
+                        ds41_bf16(view.block, DS4_N_EMBD);
+                    ds4_gpu_tensor_free(view.block);
+                }
+                reference_ok = ds41_dense_m3_timing_path_end(
+                    before_ms, before_command_buffers, reference_ok,
+                    &reference_ms, &reference_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, "attention_output", false, reference_ms,
+                    reference_command_buffers);
+            } else {
+                double before_ms = 0.0;
+                uint64_t before_command_buffers = 0;
+                reference_ok = ds4_gpu_dense_m3_timing_snapshot(
+                    &before_ms, &before_command_buffers);
+                for (uint32_t row = 0; reference_ok && row < DS41_SPEC_ROWS; row++) {
+                    ds41_gpu_graph view = *g;
+                    ds41_spec_bind_row(&view, g, row, g->pos + row);
+                    view.low = legacy_low;
+                    view.block = ds4_gpu_tensor_view(legacy,
+                        (uint64_t)row * DS4_N_EMBD * sizeof(float),
+                        (uint64_t)DS4_N_EMBD * sizeof(float));
+                    reference_ok = view.block && ds41_attention_output(&view, m, l) &&
+                        ds41_bf16(view.block, DS4_N_EMBD);
+                    ds4_gpu_tensor_free(view.block);
+                }
+                reference_ok = ds41_dense_m3_timing_path_end(
+                    before_ms, before_command_buffers, reference_ok,
+                    &reference_ms, &reference_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, "attention_output", false, reference_ms,
+                    reference_command_buffers);
+
+                before_ms = 0.0;
+                before_command_buffers = 0;
+                candidate_ok = ds4_gpu_dense_m3_timing_snapshot(
+                    &before_ms, &before_command_buffers);
+                if (candidate_ok) candidate_ok =
+                    ds4_gpu_dsv41_attention_output_batch(
+                        g->batch.block, g->batch.low, m->map, m->size,
+                        l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
+                        g->batch.heads, DS41_SPEC_ROWS) != 0 &&
+                    ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD,
+                                           DS41_SPEC_ROWS, DS4_V41_BF16) != 0;
+                candidate_ok = ds41_dense_m3_timing_path_end(
+                    before_ms, before_command_buffers, candidate_ok,
+                    &candidate_ms, &candidate_command_buffers);
+                ds41_dense_m3_timing_record(
+                    g, "attention_output", true, candidate_ms,
+                    candidate_command_buffers);
+            }
+        }
+        ok = ok && reference_ok && candidate_ok;
+        if (ok) ok = ds4_gpu_tensor_read(legacy, 0, legacy_host, out_bytes) != 0 &&
+                       ds4_gpu_tensor_read(g->batch.block, 0, dense_host, out_bytes) != 0;
+        const bool equal = ok && memcmp(legacy_host, dense_host, (size_t)out_bytes) == 0;
+        fprintf(stderr,
+                "ds4: V4.1 dense_m3 diagnostic timing producer=attention_output "
+                "reference_gpu_ms=%.3f candidate_gpu_ms=%.3f memcmp=%s\n",
+                reference_ms, candidate_ms, equal ? "PASS" : "FAIL");
+        if (!equal) ok = false;
+        if (had_batch && ds4_gpu_begin_commands() == 0) ok = false;
+        free(dense_host);
+        free(legacy_host);
+        ds4_gpu_tensor_free(legacy_low);
+        ds4_gpu_tensor_free(legacy);
+        if (ok) g->dense_m3_dispatches += 2;
+        return ok;
+    }
     if (!ds41_dense_m3_diagnostic_requested()) {
         const bool profile = ds41_dense_m3_profile_requested();
         const bool had_batch = profile && ds4_gpu_commands_active();
@@ -42750,6 +43097,13 @@ static bool ds41_graph_verify_rows_dense_m3(
             ok = ds4_engram_read(&g->table[table], ids[row][table],
                                  DS4_ENGRAM_COLS, engram[row][table]);
     }
+    const bool diagnostic_timing = ds41_dense_m3_diagnostic_timing_requested();
+    if (diagnostic_timing) {
+        g->dense_m3_timing_reverse = (g->dense_m3_timing_cycle++ & 1u) != 0;
+        memset(g->dense_m3_timing_groups, 0,
+               sizeof(g->dense_m3_timing_groups));
+        if (ok && !ds4_gpu_dense_m3_timing_start()) ok = false;
+    }
     const float initial_pre[] = {1, 0, 0, 0};
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++)
@@ -42768,6 +43122,16 @@ static bool ds41_graph_verify_rows_dense_m3(
             il, start);
     }
     if (ok) ok = ds41_graph_logits_verify_batch(g, m, w, row_logits);
+    if (diagnostic_timing) {
+        double diagnostic_gpu_ms = 0.0;
+        uint64_t diagnostic_command_buffers = 0;
+        const bool timing_valid = ok &&
+            ds4_gpu_dense_m3_timing_snapshot(
+                &diagnostic_gpu_ms, &diagnostic_command_buffers) != 0;
+        ds4_gpu_dense_m3_timing_stop();
+        ds41_dense_m3_timing_print_summary(
+            g, diagnostic_gpu_ms, diagnostic_command_buffers, timing_valid);
+    }
     free(engram);
     if (!ok) (void)ds4_gpu_synchronize();
     return ok;

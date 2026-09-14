@@ -78,6 +78,11 @@ int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_encoder(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_commands_active(void);
+/* Diagnostic-only GPU span accumulator.  The caller brackets a measurement
+ * and may take nested snapshots while command buffers complete. */
+int ds4_gpu_dense_m3_timing_start(void);
+int ds4_gpu_dense_m3_timing_snapshot(double *gpu_ms, uint64_t *command_buffers);
+int ds4_gpu_dense_m3_timing_stop(void);
 #ifdef __APPLE__
 /* V4.1 activation/cache formats. Buffers are float-addressable but the
  * rounded values follow the released BF16/FP8/FP4 inference graph. */

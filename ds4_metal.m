@@ -1463,6 +1463,55 @@ static void ds4_gpu_close_batch_encoder(void) {
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
 
+/* Dense-M3 diagnostic timing is deliberately armed by the graph verifier,
+ * not by normal inference.  Each completed command buffer contributes its
+ * Metal GPUStartTime/GPUEndTime span so callers can take nested path
+ * snapshots while keeping reference and candidate in one process. */
+static BOOL g_v41_dense_m3_timing_active;
+static pthread_mutex_t g_v41_dense_m3_timing_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_v41_dense_m3_timing_command_buffers;
+static double g_v41_dense_m3_timing_gpu_seconds;
+
+static void ds4_gpu_dense_m3_timing_note_completed(
+        id<MTLCommandBuffer> cb) {
+    if (!cb) return;
+    const double gpu_start = cb.GPUStartTime;
+    const double gpu_end = cb.GPUEndTime;
+    pthread_mutex_lock(&g_v41_dense_m3_timing_mutex);
+    if (g_v41_dense_m3_timing_active) {
+        g_v41_dense_m3_timing_command_buffers++;
+        if (gpu_start > 0.0 && gpu_end >= gpu_start)
+            g_v41_dense_m3_timing_gpu_seconds += gpu_end - gpu_start;
+    }
+    pthread_mutex_unlock(&g_v41_dense_m3_timing_mutex);
+}
+
+int ds4_gpu_dense_m3_timing_start(void) {
+    pthread_mutex_lock(&g_v41_dense_m3_timing_mutex);
+    g_v41_dense_m3_timing_command_buffers = 0;
+    g_v41_dense_m3_timing_gpu_seconds = 0.0;
+    g_v41_dense_m3_timing_active = YES;
+    pthread_mutex_unlock(&g_v41_dense_m3_timing_mutex);
+    return 1;
+}
+
+int ds4_gpu_dense_m3_timing_snapshot(double *gpu_ms,
+                                     uint64_t *command_buffers) {
+    if (!gpu_ms || !command_buffers) return 0;
+    pthread_mutex_lock(&g_v41_dense_m3_timing_mutex);
+    *gpu_ms = g_v41_dense_m3_timing_gpu_seconds * 1.0e3;
+    *command_buffers = g_v41_dense_m3_timing_command_buffers;
+    pthread_mutex_unlock(&g_v41_dense_m3_timing_mutex);
+    return 1;
+}
+
+int ds4_gpu_dense_m3_timing_stop(void) {
+    pthread_mutex_lock(&g_v41_dense_m3_timing_mutex);
+    g_v41_dense_m3_timing_active = NO;
+    pthread_mutex_unlock(&g_v41_dense_m3_timing_mutex);
+    return 1;
+}
+
 typedef struct {
     uint64_t command_buffers;
     uint64_t gpu_time_samples;
@@ -1703,6 +1752,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
                         label, [[cb.error localizedDescription] UTF8String]);
                 ds4_gpu_invalidate_completion_counters();
             }
+            ds4_gpu_dense_m3_timing_note_completed(cb);
             return 0;
         }
         uint64_t timeout_ms = 10000;
@@ -1734,6 +1784,7 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
     } else {
         [cb waitUntilCompleted];
     }
+    ds4_gpu_dense_m3_timing_note_completed(cb);
     if (ds4_gpu_stream_expert_timing_summary_enabled()) {
         mach_timebase_info_data_t timebase;
         (void)mach_timebase_info(&timebase);
