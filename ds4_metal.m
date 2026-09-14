@@ -3104,6 +3104,10 @@ static int ds4_gpu_env_bool(const char *name) {
     return 1;
 }
 
+static int ds4_gpu_v41_dense_m3_requested(void) {
+    return ds4_gpu_env_bool("DS4_METAL_V41_VERIFY_DENSE_M3") > 0;
+}
+
 static uint64_t ds4_gpu_env_u64(const char *name,
                                 uint64_t    fallback,
                                 uint64_t    min_value,
@@ -21208,6 +21212,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 &inner_offset);
         if (!wbuf) return 0;
 
+        const int dense_m3 = n_rows == 3u && ds4_gpu_v41_dense_m3_requested();
         ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
         if (out_dim > 65536u) dispatch.nsg = 8;
         ds4_gpu_q8_0_matvec_args args =
@@ -21218,8 +21223,10 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         args.ne1 = (int32_t)n_rows;
         args.nr0 = dispatch.nr0;
 
+        const char *function_name = dense_m3 ?
+            "kernel_mul_mv_q8_0_f32_m3" : dispatch.function_name;
         id<MTLComputePipelineState> pipeline =
-            ds4_gpu_get_mul_mv_pipeline(dispatch.function_name, dispatch.nsg);
+            ds4_gpu_get_mul_mv_pipeline(function_name, dispatch.nsg);
         if (!pipeline) return 0;
 
         int owned = 0;
@@ -21236,7 +21243,7 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
                 MTLSizeMake(((NSUInteger)out_dim +
                              (NSUInteger)dispatch.nr0 - 1u) /
                                 (NSUInteger)dispatch.nr0,
-                            (NSUInteger)n_rows,
+                            dense_m3 ? 1u : (NSUInteger)n_rows,
                             1)
              threadsPerThreadgroup:
                 MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
@@ -22501,7 +22508,9 @@ static int ds4_gpu_matmul_f16_tensor_impl(
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
 
-        if (n_tok == 1 || exact_rows) {
+        const bool dense_m3 = exact_rows && n_tok == 3u &&
+            (in_dim % 128u) == 0 && ds4_gpu_v41_dense_m3_requested();
+        if (n_tok == 1 || (exact_rows && !dense_m3)) {
             ds4_gpu_f16_matvec_args mv_args = ds4_gpu_make_f16_mv_args(in_dim, out_dim);
             mv_args.ne11 = mv_args.ne1 = (int32_t)n_tok;
             mv_args.nb12 = mv_args.nb13 = n_tok * in_dim * sizeof(float);
@@ -23384,6 +23393,36 @@ int ds4_gpu_matmul_f32_tensor(
         int owned = 0;
         id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
         if (!cb) return 0;
+
+        const bool dense_m3 = n_tok == 3u && (in_dim % 32u) == 0u &&
+            ds4_gpu_v41_dense_m3_requested();
+        if (dense_m3) {
+            ds4_gpu_q8_0_matvec_args mv_args =
+                ds4_gpu_make_f32_mv_args(in_dim, out_dim, n_tok);
+            ds4_gpu_mv_dispatch mv_dispatch =
+                ds4_gpu_make_plain_mv_dispatch(in_dim, 1);
+            mv_args.nr0 = mv_dispatch.nr0;
+            id<MTLComputePipelineState> pipeline =
+                ds4_gpu_get_mul_mv_pipeline("kernel_mul_mv_f32_f32_m3",
+                                            mv_dispatch.nsg);
+            if (!pipeline) return 0;
+            id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+            [enc setComputePipelineState:pipeline];
+            [enc setBytes:&mv_args length:sizeof(mv_args) atIndex:0];
+            [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+            [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+            [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+            if (mv_dispatch.smem)
+                [enc setThreadgroupMemoryLength:mv_dispatch.smem atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    ((NSUInteger)out_dim + (NSUInteger)mv_dispatch.nr0 - 1u) /
+                        (NSUInteger)mv_dispatch.nr0,
+                    1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)mv_dispatch.nsg, 1)];
+            ds4_gpu_end_compute_encoder(cb, enc);
+            return ds4_gpu_finish_command_buffer(cb, owned,
+                                                 "F32 exact M3 matvec");
+        }
 
         if (n_tok == 1) {
             ds4_gpu_q8_0_matvec_args mv_args = ds4_gpu_make_f32_mv_args(in_dim, out_dim, 1);
@@ -27656,9 +27695,14 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                 ds4_gpu_tensor_free(row);
             }
         } else if (ok) {
-            ok = ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
-                                              out_b_offset,
-                                              low_dim, out_dim, low, n_tokens) != 0;
+            /* The stage-1 verifier keeps the three-row output projection on
+             * the exact decode reduction tree as the one-row path. */
+            ok = n_tokens == 3u && ds4_gpu_v41_dense_m3_requested() ?
+                ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
+                    out, model_map, model_size, out_b_offset,
+                    low_dim, out_dim, low, n_tokens) != 0 :
+                ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
+                    out_b_offset, low_dim, out_dim, low, n_tokens) != 0;
         }
         DS4_METAL_PROFILE_ATTN_OUT_STAGE("out_proj");
 
