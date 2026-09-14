@@ -29275,7 +29275,7 @@ static bool metal_graph_dspark_append_v41_target_rows(
         uint32_t                  start,
         uint32_t                  accepted) {
     if (!g || !g->dspark_v41 || !dspark_model || !dw || accepted == 0 ||
-        accepted > 2u || !g->dspark_capture_batch_valid ||
+        accepted > 3u || !g->dspark_capture_batch_valid ||
         g->dspark_capture_batch_tokens < accepted + 1u ||
         !metal_graph_dspark_cache_ends_at(g, start)) return false;
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -39801,6 +39801,7 @@ bool ds4_tokens_starts_with(const ds4_tokens *tokens, const ds4_tokens *prefix) 
     X(shared_gate, DS4_N_FF_EXP) X(shared_up, DS4_N_FF_EXP) \
     X(shared_mid, DS4_N_FF_EXP) X(shared, DS4_N_EMBD) X(routed, DS4_N_EMBD)
 #define DS41_PREFILL_ROWS(X) DS41_PREFILL_STORAGE(X) DS41_PREFILL_ALIASES(X)
+enum { DS41_SPEC_ROWS = 3u, DS41_SPEC_LEGACY_ROWS = 2u };
 
 typedef struct {
 #define DS41_ROW_FIELD(name, count) ds4_gpu_tensor *name;
@@ -39886,12 +39887,13 @@ typedef struct {
     ds4_gpu_tensor *window[40];
     ds4_gpu_tensor *compressed[4], *index_cache[4];
     ds4_gpu_tensor *previous_kv[4], *previous_score[4];
-    /* k=2 V4.1 speculative verifier frontier.  These are allocated only by
-     * the explicit verifier opt-in; append-only compressed/index rows are
-     * made invisible by rewinding pos and do not need a body copy. */
+    /* V4.1 speculative verifier frontier.  These are allocated only by the
+     * explicit verifier opt-in; append-only compressed/index rows are made
+     * invisible by rewinding pos and do not need a body copy. */
     ds4_gpu_tensor *spec_raw_backup;
     ds4_gpu_tensor *spec_state_initial;
     ds4_gpu_tensor *spec_state_prefix1;
+    ds4_gpu_tensor *spec_state_prefix2;
     ds4_gpu_tensor *engram_q_norm[2], *engram_k_norm[2];
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
@@ -39948,6 +39950,7 @@ static void ds41_graph_free(ds41_gpu_graph *g) {
     ds4_gpu_tensor_free(g->spec_raw_backup);
     ds4_gpu_tensor_free(g->spec_state_initial);
     ds4_gpu_tensor_free(g->spec_state_prefix1);
+    ds4_gpu_tensor_free(g->spec_state_prefix2);
 #define DS41_FREE(name, count) ds4_gpu_tensor_free(g->name);
     DS41_SCRATCH(DS41_FREE)
 #undef DS41_FREE
@@ -39971,6 +39974,11 @@ static bool ds41_dspark_verify_requested(void) {
     return ds41_dspark_graph_requested() && v && !strcmp(v, "1");
 }
 
+static bool ds41_dspark_verify_m3_requested(void) {
+    const char *v = getenv("DS4_V41_DSPARK_SPEC_VERIFY_M3");
+    return ds41_dspark_verify_requested() && v && !strcmp(v, "1");
+}
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
@@ -39981,6 +39989,10 @@ static uint64_t ds41_graph_bytes(uint32_t ctx) {
     for (uint32_t i = 0; i < 4; i++)
         floats += ((uint64_t)ctx / (i < 3 ? 2u : 1u) + 1u) * (512u + 128u) + 2u * 512u;
     floats += (uint64_t)2 * 2 * DS4_N_EMBD * DS4_N_HC;
+    if (ds41_dspark_verify_requested()) {
+        floats += (uint64_t)40u * DS41_SPEC_ROWS * 512u;
+        floats += (uint64_t)3u * 4u * 2u * 512u;
+    }
 #define DS41_COUNT(name, count) floats += (count);
     DS41_SCRATCH(DS41_COUNT)
 #undef DS41_COUNT
@@ -40158,13 +40170,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     }
     const char *spec_verify = getenv("DS4_V41_DSPARK_SPEC_VERIFY");
     if (spec_verify && !strcmp(spec_verify, "1")) {
-        const uint64_t raw_bytes = (uint64_t)40u * 2u * 512u * sizeof(float);
+        const uint64_t raw_bytes = (uint64_t)40u * DS41_SPEC_ROWS * 512u * sizeof(float);
         const uint64_t state_bytes = (uint64_t)4u * 2u * 512u * sizeof(float);
         g->spec_raw_backup = ds4_gpu_tensor_alloc(raw_bytes);
         g->spec_state_initial = ds4_gpu_tensor_alloc(state_bytes);
         g->spec_state_prefix1 = ds4_gpu_tensor_alloc(state_bytes);
+        g->spec_state_prefix2 = ds4_gpu_tensor_alloc(state_bytes);
         if (!g->spec_raw_backup || !g->spec_state_initial ||
-            !g->spec_state_prefix1) goto fail;
+            !g->spec_state_prefix1 || !g->spec_state_prefix2) goto fail;
     }
 #define DS41_ALLOC(name, count) \
     if (!(g->name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
@@ -41974,8 +41987,6 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
     return ok;
 }
 
-#define DS41_SPEC_ROWS 2u
-
 typedef struct {
     uint32_t pos;
     ds4_engram_history history;
@@ -41990,10 +42001,6 @@ typedef struct {
     bool support_capture_valid;
     bool valid;
 } ds41_spec_frontier;
-
-static uint32_t ds41_owner_for_layer(uint32_t il) {
-    return il < 8u ? 0u : il < 14u ? 1u : il < 20u ? 2u : 3u;
-}
 
 static bool ds41_spec_copy_state(ds41_gpu_graph *g, ds4_gpu_tensor *packed,
                                   bool save) {
@@ -42014,7 +42021,8 @@ static bool ds41_spec_frontier_snapshot(ds41_spec_frontier *f,
                                          ds41_gpu_graph *g) {
     if (!f || !g || !g->valid || !g->spec_raw_backup ||
         !g->spec_state_initial || !g->spec_state_prefix1 ||
-        g->pos + DS41_SPEC_ROWS > g->ctx) return false;
+        !g->spec_state_prefix2 ||
+        g->pos + DS41_SPEC_LEGACY_ROWS > g->ctx) return false;
     memset(f, 0, sizeof(*f));
     f->pos = g->pos;
     f->history = g->history;
@@ -42044,20 +42052,23 @@ static bool ds41_spec_frontier_snapshot(ds41_spec_frontier *f,
     if (ok) ok = ds4_gpu_tensor_copy(g->spec_state_prefix1, 0,
                                       g->spec_state_initial, 0,
                                       (uint64_t)4u * 2u * row_bytes) != 0;
+    if (ok) ok = ds4_gpu_tensor_copy(g->spec_state_prefix2, 0,
+                                      g->spec_state_initial, 0,
+                                      (uint64_t)4u * 2u * row_bytes) != 0;
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) f->valid = false;
     return ok;
 }
 
-static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
-                                        ds41_gpu_graph *g,
-                                        uint32_t accepted) {
-    if (!f || !f->valid || !g || accepted > DS41_SPEC_ROWS) return false;
+static bool ds41_spec_frontier_restore_initial(ds41_spec_frontier *f,
+                                                ds41_gpu_graph *g) {
+    if (!f || !f->valid || !g || !g->spec_raw_backup ||
+        !g->spec_state_initial) return false;
     const uint64_t row_bytes = 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        for (uint32_t row = accepted; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
             ok = ds4_gpu_tensor_copy(g->window[il],
                 (uint64_t)((f->pos + row) % 128u) * row_bytes,
                 g->spec_raw_backup,
@@ -42065,31 +42076,56 @@ static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
                 row_bytes) != 0;
         }
     }
-    if (ok && accepted < DS41_SPEC_ROWS) {
-        ok = ds41_spec_copy_state(g, accepted == 0 ? g->spec_state_initial :
-                                  g->spec_state_prefix1, false);
+    if (ok) ok = ds41_spec_copy_state(g, g->spec_state_initial, false);
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    else (void)ds4_gpu_synchronize();
+    if (!ok) return false;
+    g->pos = f->pos;
+    g->valid = true;
+    g->history = f->history;
+    g->dspark_capture_generation = f->capture_generation;
+    g->dspark_capture_committed_generation = f->capture_committed_generation;
+    g->dspark_capture_pos = f->capture_pos;
+    if (g->dspark) {
+        g->dspark->dspark_cache_start = f->support_cache_start;
+        g->dspark->dspark_cache_token_start = f->support_cache_token_start;
+        g->dspark->dspark_cache_len = f->support_cache_len;
+        g->dspark->dspark_capture_mask = f->support_capture_mask;
+        g->dspark->dspark_capture_checkpoint_len =
+            f->support_capture_checkpoint_len;
+        g->dspark->dspark_capture_valid = f->support_capture_valid;
+        metal_graph_dspark_capture_batch_invalidate(g->dspark);
+    }
+    return true;
+}
+
+static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
+                                        ds41_gpu_graph *g,
+                                        uint32_t accepted_rows) {
+    if (!f || !f->valid || !g || !g->spec_raw_backup ||
+        !g->spec_state_prefix1 || !g->spec_state_prefix2 ||
+        accepted_rows < 1u || accepted_rows > DS41_SPEC_ROWS) return false;
+    const uint64_t row_bytes = 512u * sizeof(float);
+    bool ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        for (uint32_t row = accepted_rows; ok && row < DS41_SPEC_ROWS; row++) {
+            ok = ds4_gpu_tensor_copy(g->window[il],
+                (uint64_t)((f->pos + row) % 128u) * row_bytes,
+                g->spec_raw_backup,
+                ((uint64_t)il * DS41_SPEC_ROWS + row) * row_bytes,
+                row_bytes) != 0;
+        }
+    }
+    if (ok && accepted_rows < DS41_SPEC_ROWS) {
+        ok = ds41_spec_copy_state(g,
+            accepted_rows == 1u ? g->spec_state_prefix1 :
+            g->spec_state_prefix2, false);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
     else (void)ds4_gpu_synchronize();
     if (!ok) return false;
-    g->pos = f->pos + accepted;
+    g->pos = f->pos + accepted_rows;
     g->valid = true;
-    if (accepted == 0) {
-        g->history = f->history;
-        g->dspark_capture_generation = f->capture_generation;
-        g->dspark_capture_committed_generation = f->capture_committed_generation;
-        g->dspark_capture_pos = f->capture_pos;
-        if (g->dspark) {
-            g->dspark->dspark_cache_start = f->support_cache_start;
-            g->dspark->dspark_cache_token_start = f->support_cache_token_start;
-            g->dspark->dspark_cache_len = f->support_cache_len;
-            g->dspark->dspark_capture_mask = f->support_capture_mask;
-            g->dspark->dspark_capture_checkpoint_len =
-                f->support_capture_checkpoint_len;
-            g->dspark->dspark_capture_valid = f->support_capture_valid;
-            metal_graph_dspark_capture_batch_invalidate(g->dspark);
-        }
-    }
     return true;
 }
 
@@ -42097,7 +42133,7 @@ static bool ds41_spec_capture_row(ds4_gpu_graph *support,
                                    const ds4_gpu_tensor *hc,
                                    uint32_t slot, uint32_t row,
                                    uint32_t start) {
-    if (!support || !hc || row >= DS41_SPEC_ROWS ||
+    if (!support || !hc || row >= 3u ||
         slot >= support->dspark_target_layer_count ||
         !support->dspark_target_hidden_batch || !support->dspark_hc_mean_weights)
         return false;
@@ -42112,39 +42148,44 @@ static bool ds41_spec_capture_row(ds4_gpu_graph *support,
                                          DS4_V41_BF16) != 0;
     ds4_gpu_tensor_free(dst);
     if (ok) ok = metal_graph_dspark_capture_batch_note_slot(
-        support, slot, start - 1u, DS41_SPEC_ROWS + 1u);
+        support, slot, start - 1u, 4u);
     return ok;
 }
 
-/* Exact k=2 verifier: preserve one-token kernel/reduction order within each
- * row, but traverse layer-major so both causal rows share each mapped expert
- * layer.  The caller decides which prefix becomes visible. */
-static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
-                                      const ds4_model *m,
-                                      const ds4_weights *w,
-                                      const int tokens[DS41_SPEC_ROWS],
-                                      ds41_spec_frontier *frontier,
-                                      ds4_engram_history histories[DS41_SPEC_ROWS],
-                                      float *row_logits[DS41_SPEC_ROWS]) {
+/* Preserve one-token kernel/reduction order within each row, but traverse
+ * layer-major so causal rows share each mapped expert layer. */
+static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
+                                   const ds4_model *m,
+                                   const ds4_weights *w,
+                                   const int *tokens,
+                                   uint32_t n_rows,
+                                   ds41_spec_frontier *frontier,
+                                   ds4_engram_history histories[],
+                                   float *const row_logits[]) {
     if (!g || !m || !w || !tokens || !frontier || !histories ||
-        !row_logits[0] || !row_logits[1] || !g->dspark ||
+        !row_logits || !g->dspark || n_rows == 0 ||
+        n_rows > DS41_SPEC_ROWS || g->pos + n_rows > g->ctx ||
         !ds41_spec_frontier_snapshot(frontier, g)) return false;
+    for (uint32_t row = 0; row < n_rows; row++)
+        if (!row_logits[row]) return false;
     const uint32_t start = g->pos;
     const char *disable_union_env =
         getenv("DS4_METAL_DISABLE_V41_VERIFY_UNION");
     const bool disable_union = disable_union_env &&
         !strcmp(disable_union_env, "1");
-    if (start == 0 || ds41_image_at(g, start) || ds41_image_at(g, start + 1u) ||
-        !metal_graph_dspark_capture_verified_suffix_begin(
-            g->dspark, start, DS41_SPEC_ROWS, false)) return false;
+    if (start == 0) return false;
+    for (uint32_t row = 0; row < n_rows; row++)
+        if (ds41_image_at(g, start + row)) return false;
+    if (!metal_graph_dspark_capture_verified_suffix_begin(
+            g->dspark, start, n_rows, false)) return false;
 
     float (*engram)[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM] =
-        malloc(DS41_SPEC_ROWS * sizeof(*engram));
+        malloc((size_t)n_rows * sizeof(*engram));
     if (!engram) return false;
     uint32_t ids[DS41_SPEC_ROWS][2][DS4_ENGRAM_COLS];
     histories[0] = g->history;
     bool ok = true;
-    for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+    for (uint32_t row = 0; ok && row < n_rows; row++) {
         if (row) histories[row] = histories[row - 1u];
         ok = ds4_engram_hash(&g->engram, &histories[row], &tokens[row],
                              NULL, 1, &ids[row][0][0]);
@@ -42155,7 +42196,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
     }
     const float initial_pre[] = {1, 0, 0, 0};
     if (ok) ok = ds4_gpu_begin_commands() != 0;
-    for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+    for (uint32_t row = 0; ok && row < n_rows; row++) {
         ok = ds4_gpu_tensor_write(g->rows_view[row].pre, 0,
                                   initial_pre, sizeof(initial_pre)) &&
              ds41_embed(g, m, w, g->rows_view[row].residual,
@@ -42165,7 +42206,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (!g->streaming || disable_union) {
             if (ok) ok = ds4_gpu_begin_commands() != 0;
-            for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+            for (uint32_t row = 0; ok && row < n_rows; row++) {
                 ds41_gpu_graph view = *g;
                 view.pos = start + row;
 #define DS41_SPEC_LEGACY_ROW(name, width) view.name = g->rows_view[row].name;
@@ -42184,15 +42225,10 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
                 }
                 if (ok) ok = ds41_graph_layer(&view, m, &w->layer[il], il,
                                                tokens[row]);
-                if (ok && row == 0 && ds41_kv_source(il)) {
-                    const uint32_t owner = ds41_owner_for_layer(il);
-                    const uint64_t row_bytes = 512u * sizeof(float);
-                    ok = ds4_gpu_tensor_copy(g->spec_state_prefix1,
-                        (uint64_t)(owner * 2u) * row_bytes,
-                        g->previous_kv[owner], 0, row_bytes) != 0 &&
-                         ds4_gpu_tensor_copy(g->spec_state_prefix1,
-                        (uint64_t)(owner * 2u + 1u) * row_bytes,
-                        g->previous_score[owner], 0, row_bytes) != 0;
+                if (ok && row < 2u && ds41_kv_source(il)) {
+                    ok = ds41_spec_copy_state(g,
+                        row == 0u ? g->spec_state_prefix1 :
+                        g->spec_state_prefix2, true);
                 }
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42202,7 +42238,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
             continue;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = 0; ok && row < n_rows; row++) {
             ds41_gpu_graph view = *g;
             view.pos = start + row;
 #define DS41_SPEC_USE_ROW(name, width) view.name = g->rows_view[row].name;
@@ -42222,15 +42258,10 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
             if (ok) ok = ds41_graph_before_moe(&view, m, &w->layer[il], il) &&
                          ds41_moe_route(&view, m, &w->layer[il],
                                         (uint32_t)tokens[row]);
-            if (ok && row == 0 && ds41_kv_source(il)) {
-                const uint32_t owner = ds41_owner_for_layer(il);
-                const uint64_t row_bytes = 512u * sizeof(float);
-                ok = ds4_gpu_tensor_copy(g->spec_state_prefix1,
-                    (uint64_t)(owner * 2u) * row_bytes,
-                    g->previous_kv[owner], 0, row_bytes) != 0 &&
-                     ds4_gpu_tensor_copy(g->spec_state_prefix1,
-                    (uint64_t)(owner * 2u + 1u) * row_bytes,
-                    g->previous_score[owner], 0, row_bytes) != 0;
+            if (ok && row < 2u && ds41_kv_source(il)) {
+                ok = ds41_spec_copy_state(g,
+                    row == 0u ? g->spec_state_prefix1 :
+                    g->spec_state_prefix2, true);
             }
         }
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42244,7 +42275,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
                                DS4_N_FF_EXP, &down_row) &&
                  ds4_gpu_stream_expert_cache_prepare_verifier_union(
                      m->map, m->size, il, g->batch.selected,
-                     DS41_SPEC_ROWS, DS4_N_EXPERT, DS4_N_EXPERT_USED,
+                     n_rows, DS4_N_EXPERT, DS4_N_EXPERT_USED,
                      w->layer[il].ffn_gate_exps->abs_offset,
                      w->layer[il].ffn_up_exps->abs_offset,
                      w->layer[il].ffn_down_exps->abs_offset,
@@ -42256,10 +42287,10 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok && union_active) {
-            /* Submit both shared experts while the union pread worker owns the
-             * missing expert I/O.  Routed kernels remain row-wise and start
+            /* Submit all shared experts while the union pread worker owns the
+             * missing expert I/O. Routed kernels remain row-wise and start
              * only after every union address is installed. */
-            for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+            for (uint32_t row = 0; ok && row < n_rows; row++) {
                 ds41_gpu_graph view = *g;
                 view.pos = start + row;
 #define DS41_SPEC_SHARED_ROW(name, width) view.name = g->rows_view[row].name;
@@ -42272,7 +42303,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
                 ds4_gpu_stream_expert_cache_complete_verifier_union(il) != 0 &&
                 ds4_gpu_stream_expert_cache_activate_verifier_union(il) != 0;
         }
-        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = 0; ok && row < n_rows; row++) {
             ds41_gpu_graph view = *g;
             view.pos = start + row;
 #define DS41_SPEC_FINISH_ROW(name, width) view.name = g->rows_view[row].name;
@@ -42293,7 +42324,7 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
             "ds4: V4.1 speculative verifier failed at layer %u pos=%u\n",
             il, start);
     }
-    for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+    for (uint32_t row = 0; ok && row < n_rows; row++) {
         ds41_gpu_graph view = *g;
         view.pos = start + row;
 #define DS41_SPEC_LOGITS_ROW(name, width) view.name = g->rows_view[row].name;
@@ -42306,11 +42337,32 @@ static bool ds41_graph_verify_suffix(ds41_gpu_graph *g,
     return ok;
 }
 
-#undef DS41_SPEC_ROWS
+static DS4_MAYBE_UNUSED bool ds41_graph_verify_rows3(
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+        const int tokens[DS41_SPEC_ROWS], ds41_spec_frontier *frontier,
+        ds4_engram_history histories[DS41_SPEC_ROWS],
+        float *row_logits[DS41_SPEC_ROWS]) {
+    return ds41_graph_verify_rows(g, m, w, tokens, DS41_SPEC_ROWS,
+                                  frontier, histories, row_logits);
+}
+
+static bool ds41_graph_verify_suffix(
+        ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
+        const int tokens[DS41_SPEC_LEGACY_ROWS], ds41_spec_frontier *frontier,
+        ds4_engram_history histories[DS41_SPEC_LEGACY_ROWS],
+        float *row_logits[DS41_SPEC_LEGACY_ROWS]) {
+    return ds41_graph_verify_rows(g, m, w, tokens, DS41_SPEC_LEGACY_ROWS,
+                                  frontier, histories, row_logits);
+}
 #undef DS41_PREFILL_ROWS
 #undef DS41_PREFILL_ALIASES
 #undef DS41_PREFILL_STORAGE
 #undef DS41_CARRY_ROWS
+#endif
+
+#if !defined(__APPLE__) || defined(DS4_NO_GPU)
+static bool ds41_dspark_verify_requested(void) { return false; }
+static bool ds41_dspark_verify_m3_requested(void) { return false; }
 #endif
 
 struct ds4_vocab {
@@ -67707,6 +67759,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 fprintf(stderr, "%s\n", ds41_dspark_verify_requested() ?
                         "ds4: V4.1 DSpark k=2 verifier enabled" :
                         "ds4: V4.1 DSpark diagnostic drafter bound; verifier disabled");
+                if (ds41_dspark_verify_m3_requested()) {
+                    fprintf(stderr,
+                        "ds4: V4.1 DSpark stage1 m3_verify=on dense_m3=on "
+                        "drafter_rows=2 drafter_one_cb=on\n");
+                }
             }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
@@ -79113,7 +79170,9 @@ static int ds4_session_eval_v41_dspark_speculative(
     if (commit_cap > (uint32_t)(max_tokens - 1))
         commit_cap = (uint32_t)(max_tokens - 1);
     if (commit > commit_cap) commit = commit_cap;
-    if (ok) ok = ds41_spec_frontier_restore(&frontier, &s->ds41_graph, commit);
+    if (ok) ok = commit == 0u ?
+        ds41_spec_frontier_restore_initial(&frontier, &s->ds41_graph) :
+        ds41_spec_frontier_restore(&frontier, &s->ds41_graph, commit);
     if (ok && commit) {
         const uint64_t residual_bytes =
             (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
@@ -79141,7 +79200,7 @@ static int ds4_session_eval_v41_dspark_speculative(
     if (!ok) {
         (void)ds4_gpu_synchronize();
         const bool restored = frontier.valid &&
-            ds41_spec_frontier_restore(&frontier, &s->ds41_graph, 0);
+            ds41_spec_frontier_restore_initial(&frontier, &s->ds41_graph);
         memcpy(s->logits, initial_logits,
                (size_t)DS4_N_VOCAB * sizeof(float));
         free(initial_logits);

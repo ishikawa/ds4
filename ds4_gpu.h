@@ -2734,6 +2734,8 @@ int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
 int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected);
 int ds4_gpu_routed_moe_set_selected_lookup_override(const int32_t *selected,
                                                      uint32_t n_selected);
+/* selected contains rows*topk IDs; verifier unions up to 3 rows
+ * (18 selected IDs for the usual top-k=6 contract). */
 int ds4_gpu_stream_expert_cache_prepare_verifier_union(
         const void           *model_map,
         uint64_t              model_size,

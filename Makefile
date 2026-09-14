@@ -679,6 +679,12 @@ tests/test_v41_dspark_support.o: tests/test_v41_dspark_support.c ds4.h
 tests/test_v41_dspark_support: tests/test_v41_dspark_support.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
+tests/test_v41_dspark_spec.o: tests/test_v41_dspark_spec.c
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/test_v41_dspark_spec: tests/test_v41_dspark_spec.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
 
@@ -799,7 +805,8 @@ test-frontends: ds4_test ds4_agent_test
 
 test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-state test-linux-memory test-engram \
 	tests/test_layer_pack tests/test_engine_mgpu_placement tests/test_gpu_args \
-	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_v41_dspark_support $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
+	tests/test_deepseek4_vision_image tests/test_prompt_prefix tests/test_v41_dspark_support \
+	tests/test_v41_dspark_spec $(SAMPLING_TEST) ds4 ds4-server ds4-bench ds4-agent
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
@@ -811,6 +818,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./tests/test_prompt_prefix
 	./tests/test_sampling
 	./tests/test_deepseek4_vision_image
+	./tests/test_v41_dspark_spec
 	python3 tests/test_v41_dspark_support.py
 
 dspark-acceptance: ds4

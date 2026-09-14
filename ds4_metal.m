@@ -1018,9 +1018,9 @@ static uint32_t g_model_view_count;
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
-    /* A k=2 verifier prepares the union of two ordinary top-k=6 rows. */
+    /* A three-row verifier prepares the union of three ordinary top-k=6 rows. */
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED =
-        2 * DS4_METAL_MAX_ROUTED_EXPERT_USED,
+        3 * DS4_METAL_MAX_ROUTED_EXPERT_USED,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES =
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER *
         DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
@@ -1081,7 +1081,7 @@ typedef struct {
     uint32_t resource_count;
     uint32_t unique_count;
     uint32_t unique_misses;
-    int32_t unique_ids[2u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
+    int32_t unique_ids[3u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
     const void *model_map;
     uint64_t model_size;
     uint32_t n_total_expert;
@@ -1092,7 +1092,7 @@ typedef struct {
     uint64_t gate_expert_bytes;
     uint64_t down_expert_bytes;
     ds4_gpu_stream_expert_cache_entry
-        *resources[2u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
+        *resources[3u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
 } ds4_gpu_stream_verifier_union;
 static ds4_gpu_stream_verifier_union g_stream_verifier_union;
 static int g_stream_verifier_union_collect_pin_wait;
@@ -19265,9 +19265,9 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
         int32_t              *selected_ids,
         uint32_t              selected_capacity) {
     if (!selected_ids || rows == 0 || topk == 0 ||
-        rows > 2u || topk > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
+        rows > 3u || topk > DS4_METAL_MAX_ROUTED_EXPERT_USED ||
         rows * topk > selected_capacity ||
-        rows * topk > 2u * DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
+        rows * topk > 3u * DS4_METAL_MAX_ROUTED_EXPERT_USED) return 0;
 
     ds4_gpu_stream_expert_cache_finish_verifier_union();
     const uint32_t n_ids = rows * topk;
