@@ -75,6 +75,26 @@ static void test_cycle_commit_invariants(void) {
     assert(!cycle_fixture_append_target_row(&error, start));
 }
 
+static void test_support_cache_row_reservation(void) {
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    g.dspark_cache_cap = 128u;
+
+    assert(metal_graph_dspark_cache_set_window(&g, 100u, 128u));
+    assert(metal_graph_dspark_cache_reserve_rows(&g, 228u, 6u));
+    assert(g.dspark_cache_token_start == 106u &&
+           g.dspark_cache_len == 122u &&
+           metal_graph_dspark_cache_ends_at(&g, 228u));
+    assert(metal_graph_dspark_cache_merge_target_range(&g, 228u, 3u));
+    assert(g.dspark_cache_token_start == 106u &&
+           g.dspark_cache_len == 125u &&
+           metal_graph_dspark_cache_ends_at(&g, 231u));
+    assert(metal_graph_dspark_cache_reserve_rows(&g, 231u, 6u));
+    assert(g.dspark_cache_token_start == 109u &&
+           g.dspark_cache_len == 122u);
+    assert(!metal_graph_dspark_cache_reserve_rows(&g, 230u, 6u));
+}
+
 static void fill_tensor(ds4_gpu_tensor *tensor, float value) {
     float values[TEST_STATE_WORDS];
     for (uint32_t i = 0; i < TEST_STATE_WORDS; i++) values[i] = value;
@@ -303,6 +323,7 @@ static void test_frontier_restore(void) {
 int main(void) {
     test_forced_outcome_contract();
     test_cycle_commit_invariants();
+    test_support_cache_row_reservation();
     assert(ds4_gpu_init());
     test_frontier_restore();
     ds4_gpu_cleanup();

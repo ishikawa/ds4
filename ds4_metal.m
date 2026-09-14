@@ -7456,6 +7456,8 @@ int ds4_gpu_init(void) {
         const int drift_kv_raw_f32       = ds4_gpu_env_bool("DS4_METAL_KV_RAW_F32")         >  0; // default OFF
         const int drift_rope_exp2_log2   = ds4_gpu_env_bool("DS4_METAL_ROPE_EXP2_LOG2")     >  0; // default OFF
         const int drift_math_safe        = ds4_gpu_env_bool("DS4_METAL_MATH_SAFE")          >  0; // default OFF
+        const int fuse_small             = getenv("DS4_METAL_V41_FUSE_SMALL") &&
+            strcmp(getenv("DS4_METAL_V41_FUSE_SMALL"), "1") == 0;
 
         if (drift_math_safe) {
             // MTLCompileOptions.fastMathEnabled defaults to YES and Apple's
@@ -7483,13 +7485,14 @@ int ds4_gpu_init(void) {
         if (drift_kv_raw_f32)     macros[@"DS4_METAL_KV_RAW_F32"]         = @"1";
         if (drift_rope_exp2_log2) macros[@"DS4_METAL_ROPE_EXP2_LOG2"]     = @"1";
         fprintf(stderr,
-                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s\n",
+                "ds4: drift-patch flags hc_stable=%s norm_unify=%s kv_raw_f32=%s rope_exp2_log2=%s math_safe=%s tensor_matmul=%s fuse_small=%s\n",
                 drift_hc_stable      ? "on"  : "off",
                 drift_norm_unify     ? "on"  : "off",
                 drift_kv_raw_f32     ? "on"  : "off",
                 drift_rope_exp2_log2 ? "on"  : "off",
                 drift_math_safe      ? "on"  : "off",
-                g_metal4_tensor_api_enabled ? "on" : "off");
+                g_metal4_tensor_api_enabled ? "on" : "off",
+                fuse_small           ? "on"  : "off");
         options.preprocessorMacros = macros;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {

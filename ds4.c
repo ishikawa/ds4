@@ -28793,6 +28793,22 @@ static bool metal_graph_dspark_cache_ends_at(const ds4_gpu_graph *g,
            g->dspark_cache_token_start + g->dspark_cache_len == pos;
 }
 
+/* Reserve physical rows for a multi-token support evaluation at the frontier. */
+static bool metal_graph_dspark_cache_reserve_rows(ds4_gpu_graph *g,
+                                                  uint32_t       pos,
+                                                  uint32_t       rows) {
+    if (!g || rows == 0 || rows > g->dspark_cache_cap ||
+        !metal_graph_dspark_cache_ends_at(g, pos)) return false;
+    uint32_t logical_cap = DS4_N_SWA;
+    if (logical_cap == 0 || logical_cap > g->dspark_cache_cap)
+        logical_cap = g->dspark_cache_cap;
+    if (rows > logical_cap) return false;
+    const uint32_t keep = logical_cap - rows;
+    if (g->dspark_cache_len <= keep) return true;
+    return keep == 0 ? metal_graph_dspark_cache_set_window(g, pos, 0) :
+        metal_graph_dspark_cache_set_window(g, pos - keep, keep);
+}
+
 /* The physical ring also holds temporary draft rows; only trusted target features belong to this logical window. */
 static bool metal_graph_dspark_cache_merge_target_range(ds4_gpu_graph *g,
                                                         uint32_t start,
@@ -79388,6 +79404,14 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
 
     const ds4_dspark_weights *dw = &s->engine->dspark_weights;
     if (dw->block_size < 2u) {
+        return ds4_session_eval_v41_dspark_m3_single_row(
+            s, first_token, accepted, accepted_cap, err, errlen, start,
+            &cycle_frontier, true, false);
+    }
+    if (dw->block_size == UINT32_MAX ||
+        !metal_graph_dspark_cache_reserve_rows(
+            &s->graph, start, dw->block_size + 1u)) {
+        if (ds4_dspark_stats_enabled()) s->dspark_stats.no_room++;
         return ds4_session_eval_v41_dspark_m3_single_row(
             s, first_token, accepted, accepted_cap, err, errlen, start,
             &cycle_frontier, true, false);
