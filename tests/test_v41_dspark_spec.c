@@ -11,6 +11,70 @@ enum {
     TEST_POS = 4,
 };
 
+typedef struct {
+    uint32_t target_pos;
+    uint32_t support_next_pos;
+    uint32_t append_calls;
+} cycle_commit_fixture;
+
+static bool cycle_fixture_restore_prefix(cycle_commit_fixture *fixture,
+                                          uint32_t start,
+                                          uint32_t accepted_rows) {
+    if (!fixture || accepted_rows == 0 || accepted_rows > DS41_SPEC_ROWS)
+        return false;
+    fixture->target_pos = start + accepted_rows;
+    return true;
+}
+
+static bool cycle_fixture_append_target_row(cycle_commit_fixture *fixture,
+                                            uint32_t pos) {
+    if (!fixture || pos != fixture->support_next_pos) return false;
+    fixture->support_next_pos++;
+    fixture->append_calls++;
+    return true;
+}
+
+static void test_forced_outcome_contract(void) {
+    assert(ds41_dspark_forced_accepted_draft("full", 0) == 2u);
+    assert(ds41_dspark_forced_accepted_draft("reject1", 2) == 0u);
+    assert(ds41_dspark_forced_accepted_draft("reject2", 0) == 1u);
+    assert(ds41_dspark_forced_accepted_draft("unknown", 2) == 2u);
+    assert(ds41_dspark_forced_accepted_draft(NULL, 1) == 1u);
+}
+
+static void test_cycle_commit_invariants(void) {
+    const uint32_t start = 32u;
+    for (uint32_t accepted_draft = 0; accepted_draft <= 2u;
+         accepted_draft++) {
+        cycle_commit_fixture fixture = {
+            .target_pos = start,
+            .support_next_pos = start,
+        };
+        const uint32_t accepted_rows = 1u + accepted_draft;
+        assert(cycle_fixture_restore_prefix(
+            &fixture, start, accepted_rows));
+        for (uint32_t row = 0; row < accepted_rows; row++)
+            assert(cycle_fixture_append_target_row(&fixture, start + row));
+        assert(fixture.target_pos == fixture.support_next_pos);
+        assert(fixture.target_pos == start + accepted_rows);
+        assert(fixture.append_calls == accepted_rows);
+        assert(!cycle_fixture_append_target_row(&fixture, start));
+        assert(fixture.append_calls == accepted_rows);
+    }
+
+    cycle_commit_fixture error = {
+        .target_pos = start + DS41_SPEC_ROWS,
+        .support_next_pos = start,
+    };
+    assert(cycle_fixture_restore_prefix(&error, start, 0) == false);
+    error.target_pos = start;
+    assert(cycle_fixture_append_target_row(&error, start));
+    error.target_pos = start + 1u;
+    assert(error.target_pos == error.support_next_pos);
+    assert(error.append_calls == 1u);
+    assert(!cycle_fixture_append_target_row(&error, start));
+}
+
 static void fill_tensor(ds4_gpu_tensor *tensor, float value) {
     float values[TEST_STATE_WORDS];
     for (uint32_t i = 0; i < TEST_STATE_WORDS; i++) values[i] = value;
@@ -237,9 +301,11 @@ static void test_frontier_restore(void) {
 }
 
 int main(void) {
+    test_forced_outcome_contract();
+    test_cycle_commit_invariants();
     assert(ds4_gpu_init());
     test_frontier_restore();
     ds4_gpu_cleanup();
-    puts("V4.1 DSpark real snapshot/restore: owner prefixes, accepted_rows=1/2/3, k=2 full acceptance, and error fallback PASS");
+    puts("V4.1 DSpark cycle invariants and real snapshot/restore PASS");
     return 0;
 }

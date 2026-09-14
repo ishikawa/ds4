@@ -16,6 +16,7 @@ TOP_P=${DS4_DSPARK_FIXTURE_TOP_P:-0.95}
 MIN_P=${DS4_DSPARK_FIXTURE_MIN_P:-0.05}
 SEED=${DS4_DSPARK_FIXTURE_SEED:-12345}
 EXACT_SAMPLING=${DS4_DSPARK_FIXTURE_EXACT_SAMPLING:-0}
+VERIFY_M3=${DS4_DSPARK_FIXTURE_VERIFY_M3:-1}
 exact_sampling_arg=
 if [ "$EXACT_SAMPLING" != 0 ]; then
     exact_sampling_arg=--mtp-exact-sampling
@@ -23,6 +24,19 @@ fi
 partial_cases=0
 direct_partial_cases=0
 direct_commits=0
+
+case "$VERIFY_M3" in
+0|1) ;;
+*)
+    echo "dspark-fixture: invalid DS4_DSPARK_FIXTURE_VERIFY_M3=$VERIFY_M3" >&2
+    exit 1
+    ;;
+esac
+
+verify_m3_env=
+if [ "$VERIFY_M3" = 1 ]; then
+    verify_m3_env='DS4_V41_DSPARK_SPEC=1 DS4_V41_DSPARK_SPEC_VERIFY=1 DS4_V41_DSPARK_SPEC_VERIFY_M3=1'
+fi
 
 proposal_quality_guard_enabled() {
     case "$PROPOSAL_QUALITY_GUARD" in
@@ -102,17 +116,17 @@ print_metadata() {
     printf '# model=%s model_bytes=%s support=%s support_bytes=%s\n' \
         "$MODEL" "$(file_bytes "$MODEL")" \
         "$SUPPORT" "$(file_bytes "$SUPPORT")"
-    printf '# tokens=%s ctx=default flags="--temp %s --top-p %s --min-p %s --seed %s --nothink" exact_sampling=%s confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
+    printf '# tokens=%s ctx=default flags="--temp %s --top-p %s --min-p %s --seed %s --nothink" exact_sampling=%s verify_m3=%s confidence=%s scheduler=%s no_draft_skip=%s short_accept_no_draft_skip=%s cold_low_confidence_skip=%s cold_low_confidence_milli=%s tail_min_tokens=%s proposal_quality_guard=%s proposal_quality_active=%s c_add_min_accepted=%s require_direct=%s require_identical=%s\n' \
         "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED" \
-        "$EXACT_SAMPLING" "$confidence" "$scheduler" "$no_draft_skip" \
+        "$EXACT_SAMPLING" "$VERIFY_M3" "$confidence" "$scheduler" "$no_draft_skip" \
         "$short_accept_skip" "$cold_low_conf_skip" "$cold_low_conf_milli" \
         "$tail_min_tokens" "$PROPOSAL_QUALITY_GUARD" \
         "$PROPOSAL_QUALITY_GUARD_ACTIVE" "$C_ADD_MIN_ACCEPTED" \
         "$REQUIRE_DIRECT" "$REQUIRE_IDENTICAL"
     printf '# baseline_command=%s -m %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
         "$DS4_BIN" "$MODEL" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
-    printf '# dspark_command=DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp-model %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
-        "$DS4_BIN" "${exact_sampling_arg:+ $exact_sampling_arg}" \
+    printf '# dspark_command=%s DS4_DSPARK_STATS=1 %s --dspark%s%s -m %s --mtp-model %s --tokens %s --temp %s --top-p %s --min-p %s --seed %s --nothink -p <fixture-prompt>\n' \
+        "$verify_m3_env" "$DS4_BIN" "${exact_sampling_arg:+ $exact_sampling_arg}" \
         "${CONFIDENCE:+ --dspark-confidence $CONFIDENCE}" \
         "$MODEL" "$SUPPORT" "$TOKENS" "$TEMPERATURE" "$TOP_P" "$MIN_P" "$SEED"
 }
@@ -146,6 +160,18 @@ run_logged() {
     fi
 }
 
+run_dspark_logged() {
+    if [ "$VERIFY_M3" = 1 ]; then
+        DS4_V41_DSPARK_SPEC=1 \
+        DS4_V41_DSPARK_SPEC_VERIFY=1 \
+        DS4_V41_DSPARK_SPEC_VERIFY_M3=1 \
+        DS4_DSPARK_STATS=1 \
+        run_logged "$@"
+    else
+        DS4_DSPARK_STATS=1 run_logged "$@"
+    fi
+}
+
 run_case() {
     id=$1
     prompt=$2
@@ -159,15 +185,13 @@ run_case() {
         --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
 
     if [ -n "$CONFIDENCE" ]; then
-        DS4_DSPARK_STATS=1 \
-        run_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
+        run_dspark_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
             --dspark-confidence "$CONFIDENCE" \
             -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
             --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
     else
-        DS4_DSPARK_STATS=1 \
-        run_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
+        run_dspark_logged "$dspark_out" "$dspark_err" "$DS4_BIN" --dspark $exact_sampling_arg \
             -m "$MODEL" --mtp-model "$SUPPORT" \
             --tokens "$TOKENS" --temp "$TEMPERATURE" --top-p "$TOP_P" \
             --min-p "$MIN_P" --seed "$SEED" --nothink -p "$prompt"
@@ -185,6 +209,10 @@ run_case() {
             return 1
         fi
     fi
+    if grep -Fq 'ds4: V4.1 DSpark stage1 m3_verify=on' "$base_err"; then
+        echo "dspark-fixture: M3 enablement leaked into baseline for $id" >&2
+        return 1
+    fi
 
     base_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$base_err" | tail -n 1)
     dspark_tps=$(sed -n 's/.*generation: \([0-9.][0-9.]*\) t\/s.*/\1/p' "$dspark_err" | tail -n 1)
@@ -197,6 +225,10 @@ run_case() {
     partial=$(printf '%s\n' "$stats" | sed -n 's/.* partial=\([0-9][0-9]*\).*/\1/p')
     errors=$(printf '%s\n' "$stats" | sed -n 's/.*errors=\([0-9][0-9]*\).*/\1/p')
     accepted_draft=$(printf '%s\n' "$stats" | sed -n 's/.*accepted_draft=\([0-9][0-9]*\).*/\1/p')
+    cycles=$(printf '%s\n' "$stats" | sed -n 's/^cycles=\([0-9][0-9]*\).*/\1/p')
+    verify_rows=$(printf '%s\n' "$stats" | sed -n 's/.*v41_verify_rows=\([0-9][0-9]*\).*/\1/p')
+    accepted_rows=$(printf '%s\n' "$stats" | sed -n 's/.*v41_accepted_rows=\([0-9][0-9]*\).*/\1/p')
+    independent_target_decodes=$(printf '%s\n' "$stats" | sed -n 's/.*v41_independent_target_decodes=\([0-9][0-9]*\).*/\1/p')
     proposed=$(printf '%s\n' "$stats" | sed -n 's/.* proposed=\([0-9][0-9]*\).*/\1/p')
     first_tokens=$(printf '%s\n' "$stats" | sed -n 's/.* first_tokens=\([0-9][0-9]*\).*/\1/p')
     seed_batches=$(printf '%s\n' "$stats" | sed -n 's/.* seed_batches=\([0-9][0-9]*\).*/\1/p')
@@ -205,6 +237,10 @@ run_case() {
     partial=${partial:-0}
     errors=${errors:-0}
     accepted_draft=${accepted_draft:-0}
+    cycles=${cycles:-0}
+    verify_rows=${verify_rows:-0}
+    accepted_rows=${accepted_rows:-0}
+    independent_target_decodes=${independent_target_decodes:-0}
     proposed=${proposed:-0}
     first_tokens=${first_tokens:-0}
     seed_batches=${seed_batches:-0}
@@ -213,6 +249,22 @@ run_case() {
     if [ "$errors" -ne 0 ]; then
         echo "dspark-fixture: verifier errors for $id: $stats" >&2
         return 1
+    fi
+    if [ "$VERIFY_M3" = 1 ]; then
+        init_line=$(grep -F 'ds4: V4.1 DSpark stage1 m3_verify=on dense_m3=off drafter_rows=off drafter_one_cb=off' "$dspark_err" | tail -n 1 || true)
+        cycle_line=$(grep -F 'ds4: V4.1 DSpark stage1 cycle rows=3 dense_m3_dispatches=0 drafter_rows=off drafter_cbs=0' "$dspark_err" | tail -n 1 || true)
+        if [ -z "$init_line" ] || [ -z "$cycle_line" ]; then
+            echo "dspark-fixture: missing M3 enablement or cycle log for $id" >&2
+            return 1
+        fi
+        expected_rows=$((cycles * 3))
+        if [ "$cycles" -le 0 ] || [ "$verify_rows" -ne "$expected_rows" ] ||
+            [ "$independent_target_decodes" -ne 0 ] ||
+            [ "$accepted_rows" -lt "$cycles" ] ||
+            [ "$accepted_rows" -gt "$expected_rows" ]; then
+            echo "dspark-fixture: inconsistent M3 accounting for $id: $stats" >&2
+            return 1
+        fi
     fi
     if [ "$accepted_draft" -gt "$proposed" ] || [ "$seed_batches" -gt "$first_tokens" ]; then
         echo "dspark-fixture: inconsistent seed/draft accounting for $id: $stats" >&2

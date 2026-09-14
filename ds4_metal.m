@@ -1027,6 +1027,7 @@ enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS = 256,
     DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS = 16,
     DS4_METAL_STREAM_EXPERT_VALIDATE_WORDS = 16,
+    DS4_V41_ADDR_TABLE_BUFFERS = 4,
 };
 
 typedef struct {
@@ -1143,8 +1144,15 @@ static id<MTLBuffer> g_stream_compact_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CA
 static id<MTLBuffer> g_stream_compact_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
-static id<MTLBuffer> g_v41_addr_table_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][2];
+static id<MTLBuffer> g_v41_addr_table_buffers[
+    DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_V41_ADDR_TABLE_BUFFERS];
 static uint32_t g_v41_addr_table_next[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+
+static uint32_t ds4_v41_addr_table_buffer_count(void) {
+    const char *m3 = getenv("DS4_V41_DSPARK_SPEC_VERIFY_M3");
+    return m3 && !strcmp(m3, "1") ? DS4_V41_ADDR_TABLE_BUFFERS : 2u;
+}
+
 typedef struct {
     int active;
     uint64_t loaded_value;
@@ -12200,8 +12208,8 @@ void ds4_gpu_cleanup(void) {
             g_stream_compact_down_addr_buffers[layer] = nil;
             g_stream_compact_selected_buffers[layer] = nil;
             g_stream_selected_id_buffers[layer] = nil;
-            g_v41_addr_table_buffers[layer][0] = nil;
-            g_v41_addr_table_buffers[layer][1] = nil;
+            for (uint32_t i = 0; i < DS4_V41_ADDR_TABLE_BUFFERS; i++)
+                g_v41_addr_table_buffers[layer][i] = nil;
             g_v41_addr_table_next[layer] = 0;
             g_v41_handshake_ready_events[layer] = nil;
             g_v41_handshake_loaded_events[layer] = nil;
@@ -15559,7 +15567,9 @@ static int ds4_gpu_v41_addr_table_publish(
     }
     const double t0 = ds4_gpu_stream_expert_timing_summary_enabled() ?
         ds4_gpu_now_ms() : 0.0;
-    const uint32_t table_index = g_v41_addr_table_next[layer]++ & 1u;
+    const uint32_t table_count = ds4_v41_addr_table_buffer_count();
+    const uint32_t table_index =
+        g_v41_addr_table_next[layer]++ & (table_count - 1u);
     id<MTLBuffer> buffer = g_v41_addr_table_buffers[layer][table_index];
     if (!buffer) {
         buffer = [g_device newBufferWithLength:sizeof(ds4_gpu_v41_addr_table)
@@ -18488,7 +18498,9 @@ int ds4_gpu_v41_event_handshake_begin(
         fprintf(stderr, "ds4: failed to initialize V4.1 event handshake\n");
         return 0;
     }
-    const uint32_t table_index = g_v41_addr_table_next[layer]++ & 1u;
+    const uint32_t table_count = ds4_v41_addr_table_buffer_count();
+    const uint32_t table_index =
+        g_v41_addr_table_next[layer]++ & (table_count - 1u);
     id<MTLBuffer> table = g_v41_addr_table_buffers[layer][table_index];
     if (!table) {
         table = [g_device newBufferWithLength:sizeof(ds4_gpu_v41_addr_table)
