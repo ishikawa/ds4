@@ -41066,7 +41066,8 @@ static bool ds41_graph_logits_verify_batch(
     }
     if (ok) {
         for (uint32_t row = 0; row < DS41_SPEC_ROWS; row++)
-            memcpy(row_logits[row], all_logits + (uint64_t)row * row_bytes,
+            memcpy(row_logits[row],
+                   (const uint8_t *)all_logits + (uint64_t)row * row_bytes,
                    (size_t)row_bytes);
     }
     free(all_logits);
