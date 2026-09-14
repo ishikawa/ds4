@@ -41989,6 +41989,7 @@ static bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs, const int *toke
 
 typedef struct {
     uint32_t pos;
+    uint32_t n_rows;
     ds4_engram_history history;
     uint64_t capture_generation;
     uint64_t capture_committed_generation;
@@ -42017,14 +42018,34 @@ static bool ds41_spec_copy_state(ds41_gpu_graph *g, ds4_gpu_tensor *packed,
     return true;
 }
 
+static uint32_t ds41_owner_for_layer(uint32_t il) {
+    return il < 8u ? 0u : il < 14u ? 1u : il < 20u ? 2u : 3u;
+}
+
+static bool ds41_spec_copy_state_owner(ds41_gpu_graph *g, ds4_gpu_tensor *packed,
+                                        uint32_t owner, bool save) {
+    const uint64_t row_bytes = 512u * sizeof(float);
+    if (!g || !packed || owner >= 4u) return false;
+    ds4_gpu_tensor *state[2] = {g->previous_kv[owner], g->previous_score[owner]};
+    for (uint32_t kind = 0; kind < 2u; kind++) {
+        const uint64_t off = (uint64_t)(owner * 2u + kind) * row_bytes;
+        if (!(save ? ds4_gpu_tensor_copy(packed, off, state[kind], 0, row_bytes) :
+                     ds4_gpu_tensor_copy(state[kind], 0, packed, off, row_bytes))) return false;
+    }
+    return true;
+}
+
 static bool ds41_spec_frontier_snapshot(ds41_spec_frontier *f,
-                                         ds41_gpu_graph *g) {
+                                         ds41_gpu_graph *g,
+                                         uint32_t n_rows) {
     if (!f || !g || !g->valid || !g->spec_raw_backup ||
         !g->spec_state_initial || !g->spec_state_prefix1 ||
         !g->spec_state_prefix2 ||
-        g->pos + DS41_SPEC_LEGACY_ROWS > g->ctx) return false;
+        n_rows == 0 || n_rows > DS41_SPEC_ROWS || g->pos > g->ctx ||
+        n_rows > g->ctx - g->pos) return false;
     memset(f, 0, sizeof(*f));
     f->pos = g->pos;
+    f->n_rows = n_rows;
     f->history = g->history;
     f->capture_generation = g->dspark_capture_generation;
     f->capture_committed_generation = g->dspark_capture_committed_generation;
@@ -42041,7 +42062,7 @@ static bool ds41_spec_frontier_snapshot(ds41_spec_frontier *f,
     const uint64_t row_bytes = 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = 0; ok && row < n_rows; row++) {
             ok = ds4_gpu_tensor_copy(g->spec_raw_backup,
                 ((uint64_t)il * DS41_SPEC_ROWS + row) * row_bytes,
                 g->window[il], (uint64_t)((g->pos + row) % 128u) * row_bytes,
@@ -42064,11 +42085,12 @@ static bool ds41_spec_frontier_snapshot(ds41_spec_frontier *f,
 static bool ds41_spec_frontier_restore_initial(ds41_spec_frontier *f,
                                                 ds41_gpu_graph *g) {
     if (!f || !f->valid || !g || !g->spec_raw_backup ||
-        !g->spec_state_initial) return false;
+        !g->spec_state_initial || f->n_rows == 0 ||
+        f->n_rows > DS41_SPEC_ROWS) return false;
     const uint64_t row_bytes = 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = 0; ok && row < f->n_rows; row++) {
             ok = ds4_gpu_tensor_copy(g->window[il],
                 (uint64_t)((f->pos + row) % 128u) * row_bytes,
                 g->spec_raw_backup,
@@ -42104,11 +42126,12 @@ static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
                                         uint32_t accepted_rows) {
     if (!f || !f->valid || !g || !g->spec_raw_backup ||
         !g->spec_state_prefix1 || !g->spec_state_prefix2 ||
-        accepted_rows < 1u || accepted_rows > DS41_SPEC_ROWS) return false;
+        f->n_rows == 0 || f->n_rows > DS41_SPEC_ROWS ||
+        accepted_rows < 1u || accepted_rows > f->n_rows) return false;
     const uint64_t row_bytes = 512u * sizeof(float);
     bool ok = ds4_gpu_begin_commands() != 0;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        for (uint32_t row = accepted_rows; ok && row < DS41_SPEC_ROWS; row++) {
+        for (uint32_t row = accepted_rows; ok && row < f->n_rows; row++) {
             ok = ds4_gpu_tensor_copy(g->window[il],
                 (uint64_t)((f->pos + row) % 128u) * row_bytes,
                 g->spec_raw_backup,
@@ -42116,7 +42139,7 @@ static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
                 row_bytes) != 0;
         }
     }
-    if (ok && accepted_rows < DS41_SPEC_ROWS) {
+    if (ok && accepted_rows < f->n_rows) {
         ok = ds41_spec_copy_state(g,
             accepted_rows == 1u ? g->spec_state_prefix1 :
             g->spec_state_prefix2, false);
@@ -42132,11 +42155,14 @@ static bool ds41_spec_frontier_restore(ds41_spec_frontier *f,
 static bool ds41_spec_capture_row(ds4_gpu_graph *support,
                                    const ds4_gpu_tensor *hc,
                                    uint32_t slot, uint32_t row,
-                                   uint32_t start) {
-    if (!support || !hc || row >= 3u ||
+                                   uint32_t start, uint32_t n_rows) {
+    if (!support || !hc || row >= DS41_SPEC_ROWS || n_rows == 0 ||
+        n_rows > DS41_SPEC_ROWS || row >= n_rows ||
         slot >= support->dspark_target_layer_count ||
         !support->dspark_target_hidden_batch || !support->dspark_hc_mean_weights)
         return false;
+    const uint32_t capture_batch_tokens = n_rows + 1u;
+    if (capture_batch_tokens > DS41_SPEC_ROWS + 1u) return false;
     const uint64_t embd_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     ds4_gpu_tensor *dst = ds4_gpu_tensor_view(
         support->dspark_target_hidden_batch,
@@ -42148,7 +42174,7 @@ static bool ds41_spec_capture_row(ds4_gpu_graph *support,
                                          DS4_V41_BF16) != 0;
     ds4_gpu_tensor_free(dst);
     if (ok) ok = metal_graph_dspark_capture_batch_note_slot(
-        support, slot, start - 1u, 4u);
+        support, slot, start - 1u, capture_batch_tokens);
     return ok;
 }
 
@@ -42164,8 +42190,9 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                                    float *const row_logits[]) {
     if (!g || !m || !w || !tokens || !frontier || !histories ||
         !row_logits || !g->dspark || n_rows == 0 ||
-        n_rows > DS41_SPEC_ROWS || g->pos + n_rows > g->ctx ||
-        !ds41_spec_frontier_snapshot(frontier, g)) return false;
+        n_rows > DS41_SPEC_ROWS || g->pos > g->ctx ||
+        n_rows > g->ctx - g->pos ||
+        !ds41_spec_frontier_snapshot(frontier, g, n_rows)) return false;
     for (uint32_t row = 0; row < n_rows; row++)
         if (!row_logits[row]) return false;
     const uint32_t start = g->pos;
@@ -42221,14 +42248,14 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                 if (ok) {
                     const int slot = metal_graph_dspark_target_slot(g->dspark, il);
                     if (slot >= 0) ok = ds41_spec_capture_row(
-                        g->dspark, view.residual, (uint32_t)slot, row, start);
+                        g->dspark, view.residual, (uint32_t)slot, row, start, n_rows);
                 }
                 if (ok) ok = ds41_graph_layer(&view, m, &w->layer[il], il,
                                                tokens[row]);
-                if (ok && row < 2u && ds41_kv_source(il)) {
-                    ok = ds41_spec_copy_state(g,
+                if (ok && row + 1u < n_rows && ds41_kv_source(il)) {
+                    ok = ds41_spec_copy_state_owner(g,
                         row == 0u ? g->spec_state_prefix1 :
-                        g->spec_state_prefix2, true);
+                        g->spec_state_prefix2, ds41_owner_for_layer(il), true);
                 }
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42253,15 +42280,15 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
             if (ok) {
                 const int slot = metal_graph_dspark_target_slot(g->dspark, il);
                 if (slot >= 0) ok = ds41_spec_capture_row(
-                    g->dspark, view.residual, (uint32_t)slot, row, start);
+                    g->dspark, view.residual, (uint32_t)slot, row, start, n_rows);
             }
             if (ok) ok = ds41_graph_before_moe(&view, m, &w->layer[il], il) &&
                          ds41_moe_route(&view, m, &w->layer[il],
                                         (uint32_t)tokens[row]);
-            if (ok && row < 2u && ds41_kv_source(il)) {
-                ok = ds41_spec_copy_state(g,
+            if (ok && row + 1u < n_rows && ds41_kv_source(il)) {
+                ok = ds41_spec_copy_state_owner(g,
                     row == 0u ? g->spec_state_prefix1 :
-                    g->spec_state_prefix2, true);
+                    g->spec_state_prefix2, ds41_owner_for_layer(il), true);
             }
         }
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -67761,8 +67788,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         "ds4: V4.1 DSpark diagnostic drafter bound; verifier disabled");
                 if (ds41_dspark_verify_m3_requested()) {
                     fprintf(stderr,
-                        "ds4: V4.1 DSpark stage1 m3_verify=on dense_m3=on "
-                        "drafter_rows=2 drafter_one_cb=on\n");
+                        "ds4: V4.1 DSpark stage1 m3_verify=on dense_m3=off "
+                        "drafter_rows=off drafter_one_cb=off\n");
                 }
             }
             if (e->dspark && !e->quality && !e->dspark_strict) {
@@ -79142,7 +79169,7 @@ static int ds4_session_eval_v41_dspark_speculative(
         (uint32_t)drafts[0] >= DS4_N_VOCAB ||
         (uint32_t)drafts[1] >= DS4_N_VOCAB) return n_accept;
 
-    ds41_spec_frontier frontier;
+    ds41_spec_frontier frontier = {0};
     ds4_engram_history histories[2];
     float *rows[2] = {
         xmalloc((size_t)DS4_N_VOCAB * sizeof(float)),

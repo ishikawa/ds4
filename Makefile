@@ -679,11 +679,11 @@ tests/test_v41_dspark_support.o: tests/test_v41_dspark_support.c ds4.h
 tests/test_v41_dspark_support: tests/test_v41_dspark_support.o ds4_cpu_test_hooks.o ds4_image.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-tests/test_v41_dspark_spec.o: tests/test_v41_dspark_spec.c
-	$(CC) $(CFLAGS) -I. -c -o $@ $<
+tests/test_v41_dspark_spec.o: tests/test_v41_dspark_spec.c ds4.c ds4_gpu.h ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
-tests/test_v41_dspark_spec: tests/test_v41_dspark_spec.o
-	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+tests/test_v41_dspark_spec: tests/test_v41_dspark_spec.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
 tests/test_session_state.o: tests/test_session_state.c ds4.c ds4.h ds4_gpu.h ds4_image.h ds4_tp.h
 	$(CC) $(CFLAGS) -Wno-unused-function -DDS4_NO_GPU -I. -c -o $@ $<
