@@ -40882,17 +40882,32 @@ static bool ds41_moe_shared_verify_batch(ds41_gpu_graph *g,
         !ds41_matmul_verify_batch(g, b->shared_up, m, l->ffn_up_shexp,
                                   b->norm, DS41_SPEC_ROWS, !fused,
                                   "shared_up")) return false;
-    if (fused) {
-        if (!ds4_gpu_dsv41_swiglu_bf16(b->shared_mid, b->shared_gate,
-                                       b->shared_up, DS41_SPEC_ROWS * DS4_N_FF_EXP,
-                                       DS4_SWIGLU_CLAMP_EXP)) return false;
-    } else if (!ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate,
-                                      b->shared_up,
-                                      DS41_SPEC_ROWS * DS4_N_FF_EXP,
-                                      DS4_SWIGLU_CLAMP_EXP, 1.0f) ||
-               !ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP,
-                                       DS41_SPEC_ROWS, DS4_V41_BF16)) {
-        return false;
+    /* Keep the M1 nonlinear boundary row-wise. The dense projections above
+     * share their weight reads, but the activation must retain the existing
+     * one-row kernel and rounding order before shared_down. */
+    for (uint32_t row = 0; row < DS41_SPEC_ROWS; row++) {
+        const uint64_t offset = (uint64_t)row * DS4_N_FF_EXP * sizeof(float);
+        ds4_gpu_tensor *mid = ds4_gpu_tensor_view(b->shared_mid, offset,
+                                                   (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        ds4_gpu_tensor *gate = ds4_gpu_tensor_view(b->shared_gate, offset,
+                                                    (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        ds4_gpu_tensor *up = ds4_gpu_tensor_view(b->shared_up, offset,
+                                                  (uint64_t)DS4_N_FF_EXP * sizeof(float));
+        bool row_ok = mid && gate && up;
+        if (row_ok && fused) {
+            row_ok = ds4_gpu_dsv41_swiglu_bf16(mid, gate, up,
+                                               DS4_N_FF_EXP,
+                                               DS4_SWIGLU_CLAMP_EXP) != 0;
+        } else if (row_ok) {
+            row_ok = ds4_gpu_swiglu_tensor(mid, gate, up, DS4_N_FF_EXP,
+                                           DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0 &&
+                     ds4_gpu_dsv41_quantize(mid, DS4_N_FF_EXP, 1,
+                                            DS4_V41_BF16) != 0;
+        }
+        ds4_gpu_tensor_free(up);
+        ds4_gpu_tensor_free(gate);
+        ds4_gpu_tensor_free(mid);
+        if (!row_ok) return false;
     }
     return ds41_matmul_verify_batch(g, b->shared, m, l->ffn_down_shexp,
                                     b->shared_mid, DS41_SPEC_ROWS,
