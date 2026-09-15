@@ -2759,9 +2759,13 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
         uint64_t              down_offset,
         uint64_t              gate_expert_bytes,
         uint64_t              down_expert_bytes,
+        uint32_t              gate_type,
+        uint32_t              down_type,
         int32_t              *selected_ids,
         uint32_t              selected_capacity);
 int ds4_gpu_stream_expert_cache_complete_verifier_union(uint32_t layer);
+int ds4_gpu_stream_expert_cache_verifier_union_two_stage_active(uint32_t layer);
+int ds4_gpu_stream_expert_cache_activate_resident_union(uint32_t layer);
 int ds4_gpu_stream_expert_cache_activate_verifier_union(uint32_t layer);
 void ds4_gpu_stream_expert_cache_finish_verifier_union(void);
 void ds4_gpu_set_glm_mtp_verify_mode(bool enabled);

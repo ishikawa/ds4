@@ -41146,8 +41146,9 @@ static bool ds41_moe_shared(ds41_gpu_graph *g, const ds4_model *m,
     return true;
 }
 
-static bool ds41_moe_routed(ds41_gpu_graph *g, const ds4_model *m,
-                            const ds4_layer_weights *l, uint32_t il) {
+static bool ds41_moe_routed_stage(ds41_gpu_graph *g, const ds4_model *m,
+                                  const ds4_layer_weights *l, uint32_t il,
+                                  bool resident_only) {
     uint64_t gate_row = 0, down_row = 0;
     if (!tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) ||
         !tensor_nbytes(l->ffn_down_exps->type, DS4_N_FF_EXP, &down_row)) return false;
@@ -41161,6 +41162,7 @@ static bool ds41_moe_routed(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, g->selected, g->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, g->norm, NULL, il,
             !g->streaming)) return false;
+    if (resident_only) return true;
     /* Keep the shared expert's BF16 boundary, then include it exactly once
      * in the existing F32 reduction. Alternate ownership across layers. */
     if (shared_owner && g->tp_rank == (il & 1u) &&
@@ -41171,6 +41173,11 @@ static bool ds41_moe_routed(ds41_gpu_graph *g, const ds4_model *m,
     }
     return (shared_owner || ds4_gpu_add_tensor(g->block, routed, g->shared, DS4_N_EMBD)) &&
            ds41_bf16(g->block, DS4_N_EMBD);
+}
+
+static bool ds41_moe_routed(ds41_gpu_graph *g, const ds4_model *m,
+                            const ds4_layer_weights *l, uint32_t il) {
+    return ds41_moe_routed_stage(g, m, l, il, false);
 }
 
 static bool ds41_moe_after_route(ds41_gpu_graph *g, const ds4_model *m,
@@ -43109,6 +43116,7 @@ static bool ds41_graph_verify_dense_m3_layer(
 
     int32_t selected_ids[DS41_SPEC_ROWS * DS4_N_EXPERT_USED];
     bool union_active = false;
+    bool union_two_stage = false;
     if (ok && union_mode) {
         uint64_t gate_row = 0, down_row = 0;
         ok = tensor_nbytes(l->ffn_gate_exps->type, DS4_N_EMBD, &gate_row) &&
@@ -43119,11 +43127,24 @@ static bool ds41_graph_verify_dense_m3_layer(
                  l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
                  l->ffn_down_exps->abs_offset,
                  gate_row * DS4_N_FF_EXP, down_row * DS4_N_EMBD,
+                 l->ffn_gate_exps->type, l->ffn_down_exps->type,
                  selected_ids, DS41_SPEC_ROWS * DS4_N_EXPERT_USED) != 0;
         union_active = ok;
+        union_two_stage = union_active &&
+            ds4_gpu_stream_expert_cache_verifier_union_two_stage_active(il) != 0;
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds41_moe_shared_verify_batch(g, m, l, il);
+    if (ok && union_active && union_two_stage) {
+        for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
+            ds41_gpu_graph view;
+            ds41_spec_bind_row(&view, g, row, start + row);
+            ok = ds4_gpu_routed_moe_set_selected_lookup_override(
+                &selected_ids[row * DS4_N_EXPERT_USED],
+                DS4_N_EXPERT_USED) != 0 &&
+                 ds41_moe_routed_stage(&view, m, l, il, true);
+        }
+    }
     if (ok && union_active) {
         ok = ds4_gpu_flush_commands() != 0 &&
              ds4_gpu_stream_expert_cache_complete_verifier_union(il) != 0 &&
@@ -43135,7 +43156,9 @@ static bool ds41_graph_verify_dense_m3_layer(
         if (union_active) ok =
             ds4_gpu_routed_moe_set_selected_lookup_override(
                 &selected_ids[row * DS4_N_EXPERT_USED], DS4_N_EXPERT_USED) != 0;
-        if (ok) ok = ds41_moe_routed(&view, m, l, il) &&
+        if (ok) ok = (union_two_stage ?
+                      ds41_moe_routed_stage(&view, m, l, il, false) :
+                      ds41_moe_routed(&view, m, l, il)) &&
                          ds41_graph_after_moe(&view);
     }
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -43345,6 +43368,7 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
         if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
         int32_t selected_ids[DS41_SPEC_ROWS * DS4_N_EXPERT_USED];
         bool union_active = false;
+        bool union_two_stage = false;
         if (ok) {
             uint64_t gate_row = 0, down_row = 0;
             ok = tensor_nbytes(w->layer[il].ffn_gate_exps->type,
@@ -43359,9 +43383,13 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                      w->layer[il].ffn_down_exps->abs_offset,
                      gate_row * DS4_N_FF_EXP,
                      down_row * DS4_N_EMBD,
+                     w->layer[il].ffn_gate_exps->type,
+                     w->layer[il].ffn_down_exps->type,
                      selected_ids,
                      DS41_SPEC_ROWS * DS4_N_EXPERT_USED) != 0;
             union_active = ok;
+            union_two_stage = union_active &&
+                ds4_gpu_stream_expert_cache_verifier_union_two_stage_active(il) != 0;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         if (ok && union_active) {
@@ -43375,6 +43403,20 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                 DS41_PREFILL_ROWS(DS41_SPEC_SHARED_ROW)
 #undef DS41_SPEC_SHARED_ROW
                 ok = ds41_moe_shared(&view, m, &w->layer[il], il);
+            }
+            if (ok && union_two_stage) {
+                ok = ds4_gpu_stream_expert_cache_activate_resident_union(il) != 0;
+                for (uint32_t row = 0; ok && row < n_rows; row++) {
+                    ds41_gpu_graph view = *g;
+                    view.pos = start + row;
+#define DS41_SPEC_RESIDENT_ROW(name, width) view.name = g->rows_view[row].name;
+                    DS41_PREFILL_ROWS(DS41_SPEC_RESIDENT_ROW)
+#undef DS41_SPEC_RESIDENT_ROW
+                    ok = ds4_gpu_routed_moe_set_selected_lookup_override(
+                             &selected_ids[row * DS4_N_EXPERT_USED],
+                             DS4_N_EXPERT_USED) != 0 &&
+                         ds41_moe_routed_stage(&view, m, &w->layer[il], il, true);
+                }
             }
             if (ok) ok = ds4_gpu_flush_commands() != 0;
             if (ok) ok =
@@ -43392,7 +43434,9 @@ static bool ds41_graph_verify_rows(ds41_gpu_graph *g,
                     &selected_ids[row * DS4_N_EXPERT_USED],
                     DS4_N_EXPERT_USED) != 0;
             if (ok) ok = (union_active ?
-                          ds41_moe_routed(&view, m, &w->layer[il], il) :
+                          (union_two_stage ?
+                           ds41_moe_routed_stage(&view, m, &w->layer[il], il, false) :
+                           ds41_moe_routed(&view, m, &w->layer[il], il)) :
                           ds41_moe_after_route(&view, m, &w->layer[il], il)) &&
                          ds41_graph_after_moe(&view);
         }

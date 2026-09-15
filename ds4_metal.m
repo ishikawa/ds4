@@ -1082,6 +1082,10 @@ typedef struct {
     uint32_t resource_count;
     uint32_t unique_count;
     uint32_t unique_misses;
+    uint32_t resident_mask;
+    uint32_t missing_mask;
+    int two_stage;
+    int stage;
     int32_t unique_ids[3u * DS4_METAL_MAX_ROUTED_EXPERT_USED];
     const void *model_map;
     uint64_t model_size;
@@ -1098,6 +1102,17 @@ typedef struct {
 static ds4_gpu_stream_verifier_union g_stream_verifier_union;
 static int g_stream_verifier_union_collect_pin_wait;
 static double g_stream_verifier_union_pin_wait_ms;
+enum {
+    DS4_METAL_VERIFIER_UNION_STAGE_NONE = 0,
+    DS4_METAL_VERIFIER_UNION_STAGE_RESIDENT = 1,
+    DS4_METAL_VERIFIER_UNION_STAGE_MISSING = 2,
+};
+static uint64_t g_stream_verifier_union_two_stage_layers;
+static uint64_t g_stream_verifier_union_two_stage_resident_experts;
+static uint64_t g_stream_verifier_union_two_stage_missing_experts;
+static uint64_t g_stream_verifier_union_two_stage_fallbacks;
+static uint64_t g_stream_verifier_union_two_stage_resident_zero_fallbacks;
+static int g_stream_verifier_union_two_stage_enabled = -1;
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -3210,6 +3225,31 @@ static int ds4_gpu_env_bool(const char *name) {
 
 static int ds4_gpu_v41_dense_m3_requested(void) {
     return ds4_gpu_env_bool("DS4_METAL_V41_VERIFY_DENSE_M3") > 0;
+}
+
+static int ds4_gpu_stream_verifier_union_two_stage_requested(void) {
+    if (g_stream_verifier_union_two_stage_enabled >= 0) {
+        return g_stream_verifier_union_two_stage_enabled;
+    }
+    const char *value = getenv("DS4_METAL_V41_VERIFY_UNION_TWO_STAGE");
+    g_stream_verifier_union_two_stage_enabled = value && strcmp(value, "1") == 0;
+    return g_stream_verifier_union_two_stage_enabled;
+}
+
+static void ds4_gpu_print_verifier_union_two_stage_stats(void) {
+    if (!ds4_gpu_stream_verifier_union_two_stage_requested() &&
+        g_stream_verifier_union_two_stage_layers == 0 &&
+        g_stream_verifier_union_two_stage_fallbacks == 0) {
+        return;
+    }
+    fprintf(stderr,
+            "ds4: verifier union two-stage layers=%llu resident_experts=%llu "
+            "missing_experts=%llu fallback_layers=%llu resident_zero_fallbacks=%llu\n",
+            (unsigned long long)g_stream_verifier_union_two_stage_layers,
+            (unsigned long long)g_stream_verifier_union_two_stage_resident_experts,
+            (unsigned long long)g_stream_verifier_union_two_stage_missing_experts,
+            (unsigned long long)g_stream_verifier_union_two_stage_fallbacks,
+            (unsigned long long)g_stream_verifier_union_two_stage_resident_zero_fallbacks);
 }
 
 static uint64_t ds4_gpu_env_u64(const char *name,
@@ -7601,6 +7641,9 @@ int ds4_gpu_init(void) {
                 drift_math_safe      ? "on"  : "off",
                 g_metal4_tensor_api_enabled ? "on" : "off",
                 fuse_small           ? "on"  : "off");
+        fprintf(stderr,
+                "ds4: verifier union two-stage=%s flag gates=off\n",
+                ds4_gpu_stream_verifier_union_two_stage_requested() ? "on" : "off");
         options.preprocessorMacros = macros;
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
@@ -12304,6 +12347,7 @@ void ds4_gpu_cleanup(void) {
             getenv("DS4_METAL_MEMORY_REPORT") == NULL) {
             ds4_gpu_print_memory_report("at cleanup");
         }
+        ds4_gpu_print_verifier_union_two_stage_stats();
         g_selected_readback_event = nil;
         g_selected_readback_event_value = 0;
         [g_transient_buffers removeAllObjects];
@@ -16324,6 +16368,11 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
         g_stream_expert_timing_split_missing_prune_ms = 0.0;
         g_stream_expert_timing_split_missing_addr_ms = 0.0;
         g_stream_expert_timing_split_missing_wait_ms = 0.0;
+        g_stream_verifier_union_two_stage_layers = 0;
+        g_stream_verifier_union_two_stage_resident_experts = 0;
+        g_stream_verifier_union_two_stage_missing_experts = 0;
+        g_stream_verifier_union_two_stage_fallbacks = 0;
+        g_stream_verifier_union_two_stage_resident_zero_fallbacks = 0;
         g_stream_expert_timing_addr_table_calls = 0;
         g_stream_expert_timing_addr_table_publish_ms = 0.0;
         g_stream_expert_timing_addr_table_encode_ms = 0.0;
@@ -19370,6 +19419,10 @@ void ds4_gpu_stream_expert_cache_finish_verifier_union(void) {
     g_stream_verifier_union.resource_count = 0;
     g_stream_verifier_union.unique_count = 0;
     g_stream_verifier_union.unique_misses = 0;
+    g_stream_verifier_union.resident_mask = 0;
+    g_stream_verifier_union.missing_mask = 0;
+    g_stream_verifier_union.two_stage = 0;
+    g_stream_verifier_union.stage = DS4_METAL_VERIFIER_UNION_STAGE_NONE;
 }
 
 int ds4_gpu_stream_expert_cache_prepare_verifier_union(
@@ -19385,6 +19438,8 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
         uint64_t              down_offset,
         uint64_t              gate_expert_bytes,
         uint64_t              down_expert_bytes,
+        uint32_t              gate_type,
+        uint32_t              down_type,
         int32_t              *selected_ids,
         uint32_t              selected_capacity) {
     if (!selected_ids || rows == 0 || topk == 0 ||
@@ -19418,6 +19473,26 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
     g_stream_verifier_union.down_offset = down_offset;
     g_stream_verifier_union.gate_expert_bytes = gate_expert_bytes;
     g_stream_verifier_union.down_expert_bytes = down_expert_bytes;
+    const int two_stage_candidate =
+        ds4_gpu_stream_verifier_union_two_stage_requested() &&
+        g_ssd_streaming_mode &&
+        rows <= 3u && topk == 6u &&
+        gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+        down_type == DS4_METAL_TENSOR_Q2_K &&
+        !g_quality_mode &&
+        getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+        getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+        getenv("DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS") == NULL &&
+        g_tp_split_world == 1 &&
+        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline != nil &&
+        g_moe_mul_mv_slots6_q2_k_sum6_pipeline != nil &&
+        ds4_gpu_stream_expert_cache_effective_cap(layer,
+                                                  n_total_expert,
+                                                  g_stream_verifier_union.unique_count) != 0 &&
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
+        getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR") == NULL &&
+        g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
+        g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
     for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
         const uint64_t id = (uint32_t)g_stream_verifier_union.unique_ids[u];
         const uint64_t gate_abs = gate_offset + id * gate_expert_bytes;
@@ -19429,6 +19504,54 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
                 up_offset + id * gate_expert_bytes, down_abs,
                 gate_expert_bytes, down_expert_bytes)) {
             g_stream_verifier_union.unique_misses++;
+            if (two_stage_candidate) {
+                g_stream_verifier_union.missing_mask |= 1u << u;
+            }
+        } else if (two_stage_candidate) {
+            g_stream_verifier_union.resident_mask |= 1u << u;
+        }
+    }
+    if (two_stage_candidate &&
+        g_stream_verifier_union.resident_mask != 0 &&
+        g_stream_verifier_union.missing_mask != 0) {
+        g_stream_verifier_union.two_stage = 1;
+        for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
+            if ((g_stream_verifier_union.resident_mask & (1u << u)) == 0) {
+                continue;
+            }
+            const uint32_t id =
+                (uint32_t)g_stream_verifier_union.unique_ids[u];
+            const uint64_t gate_abs = g_stream_verifier_union.gate_offset +
+                (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+            const uint64_t up_abs = g_stream_verifier_union.up_offset +
+                (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+            const uint64_t down_abs = g_stream_verifier_union.down_offset +
+                (uint64_t)id * g_stream_verifier_union.down_expert_bytes;
+            ds4_gpu_stream_expert_cache_entry *entry =
+                &g_stream_expert_cache[layer][id];
+            if (!ds4_gpu_stream_expert_cache_entry_matches(
+                    entry, model_map, model_size, gate_abs, up_abs, down_abs,
+                    g_stream_verifier_union.gate_expert_bytes,
+                    g_stream_verifier_union.down_expert_bytes) ||
+                !ds4_gpu_stream_expert_cache_set_addr_slot_raw(
+                    layer, id, entry->gate_buffer, entry->gate_inner,
+                    entry->up_buffer, entry->up_inner,
+                    entry->down_buffer, entry->down_inner)) {
+                ds4_gpu_stream_expert_cache_finish_verifier_union();
+                return 0;
+            }
+            g_stream_verifier_union.resources[u] = entry;
+        }
+        g_stream_verifier_union.resource_count =
+            g_stream_verifier_union.unique_count;
+    } else if (two_stage_candidate) {
+        g_stream_verifier_union.resident_mask = 0;
+        g_stream_verifier_union.missing_mask = 0;
+        g_stream_verifier_union.two_stage = 0;
+        g_stream_verifier_union_two_stage_fallbacks++;
+        if (g_stream_verifier_union.unique_misses ==
+            g_stream_verifier_union.unique_count) {
+            g_stream_verifier_union_two_stage_resident_zero_fallbacks++;
         }
     }
     const ds4_gpu_stream_expert_table table = {
@@ -19454,6 +19577,13 @@ int ds4_gpu_stream_expert_cache_prepare_verifier_union(
         return 0;
     }
     g_stream_verifier_union.active = 1;
+    if (g_stream_verifier_union.two_stage) {
+        g_stream_verifier_union_two_stage_layers++;
+        g_stream_verifier_union_two_stage_resident_experts +=
+            (uint64_t)__builtin_popcount(g_stream_verifier_union.resident_mask);
+        g_stream_verifier_union_two_stage_missing_experts +=
+            (uint64_t)__builtin_popcount(g_stream_verifier_union.missing_mask);
+    }
     g_stream_expert_timing_union_calls++;
     g_stream_expert_timing_union_experts +=
         g_stream_verifier_union.unique_count;
@@ -19471,6 +19601,37 @@ int ds4_gpu_stream_expert_cache_complete_verifier_union(uint32_t layer) {
         !ds4_gpu_stream_expert_cache_ensure_addr_buffers(layer)) return 0;
     g_stream_expert_timing_union_pread_ms +=
         g_stream_expert_pending_last_elapsed_ms;
+    if (g_stream_verifier_union.two_stage) {
+        if (!ds4_gpu_wait_pending_command_buffers(
+                "verifier union resident")) return 0;
+        for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
+            if ((g_stream_verifier_union.missing_mask & (1u << u)) == 0) {
+                continue;
+            }
+            const uint32_t id =
+                (uint32_t)g_stream_verifier_union.unique_ids[u];
+            const uint64_t gate_abs = g_stream_verifier_union.gate_offset +
+                (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+            const uint64_t up_abs = g_stream_verifier_union.up_offset +
+                (uint64_t)id * g_stream_verifier_union.gate_expert_bytes;
+            const uint64_t down_abs = g_stream_verifier_union.down_offset +
+                (uint64_t)id * g_stream_verifier_union.down_expert_bytes;
+            ds4_gpu_stream_expert_cache_entry *entry =
+                ds4_gpu_stream_expert_cache_peek(
+                    g_stream_verifier_union.model_map,
+                    g_stream_verifier_union.model_size, layer, id,
+                    g_stream_verifier_union.n_total_expert,
+                    g_stream_verifier_union.topk, gate_abs, up_abs, down_abs,
+                    g_stream_verifier_union.gate_expert_bytes,
+                    g_stream_verifier_union.down_expert_bytes);
+            if (!entry || !ds4_gpu_stream_expert_cache_set_addr_slot_raw(
+                    layer, id, entry->gate_buffer, entry->gate_inner,
+                    entry->up_buffer, entry->up_inner,
+                    entry->down_buffer, entry->down_inner)) return 0;
+            g_stream_verifier_union.resources[u] = entry;
+        }
+        return 1;
+    }
     g_stream_verifier_union.resource_count = 0;
     for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
         const uint32_t id =
@@ -19499,13 +19660,65 @@ int ds4_gpu_stream_expert_cache_complete_verifier_union(uint32_t layer) {
     return 1;
 }
 
+int ds4_gpu_stream_expert_cache_verifier_union_two_stage_active(uint32_t layer) {
+    return g_stream_verifier_union.active &&
+           g_stream_verifier_union.layer == layer &&
+           g_stream_verifier_union.two_stage;
+}
+
+int ds4_gpu_stream_expert_cache_activate_resident_union(uint32_t layer) {
+    if (!g_stream_verifier_union.active ||
+        g_stream_verifier_union.layer != layer) return 0;
+    if (!g_stream_verifier_union.two_stage) return 1;
+    if (g_stream_verifier_union.stage != DS4_METAL_VERIFIER_UNION_STAGE_NONE ||
+        g_stream_verifier_union.resident_mask == 0 ||
+        g_stream_verifier_union.resource_count == 0) return 0;
+    if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(
+            g_stream_verifier_union.resources,
+            g_stream_verifier_union.unique_count,
+            g_stream_verifier_union.resident_mask)) return 0;
+    g_stream_verifier_union.stage = DS4_METAL_VERIFIER_UNION_STAGE_RESIDENT;
+    return 1;
+}
+
 int ds4_gpu_stream_expert_cache_activate_verifier_union(uint32_t layer) {
     if (!g_stream_verifier_union.active ||
         g_stream_verifier_union.layer != layer) return 0;
+    if (g_stream_verifier_union.two_stage) {
+        if (g_stream_verifier_union.stage !=
+                DS4_METAL_VERIFIER_UNION_STAGE_RESIDENT ||
+            g_stream_verifier_union.missing_mask == 0) return 0;
+        if (!ds4_gpu_stream_expert_cache_mark_entries_inflight(
+                g_stream_verifier_union.resources,
+                g_stream_verifier_union.unique_count,
+                g_stream_verifier_union.missing_mask)) return 0;
+        g_stream_verifier_union.stage = DS4_METAL_VERIFIER_UNION_STAGE_MISSING;
+        return 1;
+    }
     if (g_stream_verifier_union.resource_count == 0) return 1;
     return ds4_gpu_stream_expert_cache_mark_entries_inflight(
         g_stream_verifier_union.resources,
         g_stream_verifier_union.resource_count, 0);
+}
+
+static uint32_t ds4_gpu_stream_verifier_union_route_mask(
+        const int32_t *selected_ids,
+        uint32_t       n_selected,
+        uint32_t       unique_mask) {
+    if (!selected_ids || n_selected > DS4_METAL_MAX_ROUTED_EXPERT_USED) {
+        return 0;
+    }
+    uint32_t route_mask = 0;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        for (uint32_t u = 0; u < g_stream_verifier_union.unique_count; u++) {
+            if ((unique_mask & (1u << u)) != 0 &&
+                selected_ids[i] == g_stream_verifier_union.unique_ids[u]) {
+                route_mask |= 1u << i;
+                break;
+            }
+        }
+    }
+    return route_mask;
 }
 
 int ds4_gpu_stream_expert_cache_seed_selected(
@@ -42175,6 +42388,13 @@ int ds4_gpu_routed_moe_one_tensor(
     ds4_gpu_stream_expert_cache_note_token(layer_index);
 
     @autoreleasepool {
+        const int verifier_union_stage =
+            g_stream_verifier_union.active &&
+            g_stream_verifier_union.layer == layer_index ?
+                g_stream_verifier_union.stage :
+                DS4_METAL_VERIFIER_UNION_STAGE_NONE;
+        const bool verifier_union_staging =
+            verifier_union_stage != DS4_METAL_VERIFIER_UNION_STAGE_NONE;
         id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
         id<MTLBuffer> gatebuf = ds4_gpu_tensor_buffer(gate);
         id<MTLBuffer> upbuf = ds4_gpu_tensor_buffer(up);
@@ -42824,6 +43044,7 @@ int ds4_gpu_routed_moe_one_tensor(
             use_mxfp4_selected_slots || use_iq2_stream_addr_table;
         const bool use_v41_handshake =
             use_iq2_selected_slots &&
+            !verifier_union_staging &&
             ds4_gpu_v41_handshake_take(layer_index,
                                        &v41_addr_table_buf,
                                        &v41_handshake_loaded_event,
@@ -43202,6 +43423,7 @@ int ds4_gpu_routed_moe_one_tensor(
             const bool use_stream_compact_addr =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
+                !verifier_union_staging &&
                 ds4_gpu_stream_compact_addr_requested() &&
                 !stream_split_ready &&
                 !ds4_gpu_stream_expert_masked_addr_requested() &&
@@ -43210,6 +43432,7 @@ int ds4_gpu_routed_moe_one_tensor(
             use_stream_expert_split_candidate =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
+                !verifier_union_staging &&
                 !ds4_gpu_v41_addr_table_requested() &&
                 !use_stream_compact_addr &&
                 stream_split_ready &&
@@ -43509,7 +43732,8 @@ int ds4_gpu_routed_moe_one_tensor(
             if (use_stream_expert_cache) {
                 use_stream_expert_addr_table =
                     ((use_iq2_selected_slots &&
-                      ds4_gpu_stream_expert_addr_table_kernel_requested() &&
+                      (ds4_gpu_stream_expert_addr_table_kernel_requested() ||
+                       verifier_union_staging) &&
                       g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline != nil &&
                       g_moe_mul_mv_addr_q2_k_sum6_pipeline != nil) ||
                      use_iq2_stream_addr_table) &&
@@ -43526,10 +43750,13 @@ int ds4_gpu_routed_moe_one_tensor(
                 use_stream_expert_masked_addr_table =
                     use_stream_expert_addr_table &&
                     use_iq2_selected_slots &&
-                    ds4_gpu_stream_expert_masked_addr_requested() &&
+                    getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR") == NULL &&
+                    (ds4_gpu_stream_expert_masked_addr_requested() ||
+                     verifier_union_staging) &&
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
                     g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
                 use_stream_expert_split_deferred =
+                    !verifier_union_staging &&
                     use_stream_expert_split_candidate &&
                     use_stream_expert_masked_addr_table &&
                     stream_expert_resident_mask != 0 &&
@@ -43559,7 +43786,8 @@ int ds4_gpu_routed_moe_one_tensor(
                     }
                 }
                 if (stream_expert_missing_mask != 0 &&
-                    !use_stream_expert_split_deferred) {
+                    !use_stream_expert_split_deferred &&
+                    !verifier_union_staging) {
                     if (!ds4_gpu_stream_expert_cache_load_selected_missing(
                             model_map,
                             model_size,
@@ -43589,7 +43817,8 @@ int ds4_gpu_routed_moe_one_tensor(
                         down_slot_offsets[i] = entry->down_inner;
                     }
                 }
-                if (use_iq2_stream_addr_table && use_stream_expert_addr_table) {
+                if (use_iq2_stream_addr_table && use_stream_expert_addr_table &&
+                    !verifier_union_staging) {
                     for (uint32_t i = 0; i < n_expert; i++) {
                         ds4_gpu_stream_expert_cache_entry *entry = stream_slot_entries[i];
                         if (!entry) { if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33214); return 0; }
@@ -43607,15 +43836,18 @@ int ds4_gpu_routed_moe_one_tensor(
                         }
                     }
                 }
-                ds4_gpu_stream_expert_cache_prune_layer(layer_index,
-                                                        n_total_expert,
-                                                        n_expert,
-                                                        selected_ids,
-                                                        n_expert);
-                ds4_gpu_stream_expert_cache_prune_global(layer_index,
-                                                         selected_ids,
-                                                         n_expert);
-                if (ds4_gpu_v41_addr_table_requested() &&
+                if (!verifier_union_staging) {
+                    ds4_gpu_stream_expert_cache_prune_layer(layer_index,
+                                                            n_total_expert,
+                                                            n_expert,
+                                                            selected_ids,
+                                                            n_expert);
+                    ds4_gpu_stream_expert_cache_prune_global(layer_index,
+                                                             selected_ids,
+                                                             n_expert);
+                }
+                if (!verifier_union_staging &&
+                    ds4_gpu_v41_addr_table_requested() &&
                     use_iq2_selected_slots) {
                     if (!g_moe_v41_addr_table_iq2_xxs_pair_swiglu_pipeline ||
                         !g_moe_v41_addr_table_q2_k_sum6_pipeline ||
@@ -44154,7 +44386,52 @@ int ds4_gpu_routed_moe_one_tensor(
                             2,
                             false);
                 } else if (use_stream_expert_masked_addr_table) {
-                    if (use_stream_expert_split_deferred) {
+                    const uint32_t verifier_union_active_mask =
+                        verifier_union_staging ?
+                            ds4_gpu_stream_verifier_union_route_mask(
+                                selected_ids,
+                                n_expert,
+                                verifier_union_stage ==
+                                    DS4_METAL_VERIFIER_UNION_STAGE_RESIDENT ?
+                                    g_stream_verifier_union.resident_mask :
+                                    g_stream_verifier_union.missing_mask) :
+                            0;
+                    if (verifier_union_staging) {
+                        stream_expert_split_completed =
+                            verifier_union_stage ==
+                            DS4_METAL_VERIFIER_UNION_STAGE_RESIDENT;
+                        if (verifier_union_active_mask != 0) {
+                            ds4_gpu_stream_expert_split_args stage_pair_args = {
+                                .active_mask = verifier_union_active_mask,
+                                .accumulate = 0u,
+                            };
+                            ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu_masked(
+                                cb,
+                                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline,
+                                &gate_args,
+                                &act_args,
+                                &stage_pair_args,
+                                stream_slot_entries,
+                                stream_gate_addr_buf,
+                                stream_up_addr_buf,
+                                xbuf,
+                                ds4_gpu_tensor_offset(x),
+                                gatebuf,
+                                ds4_gpu_tensor_offset(gate),
+                                upbuf,
+                                ds4_gpu_tensor_offset(up),
+                                midbuf,
+                                ds4_gpu_tensor_offset(mid),
+                                selected_exec_buf,
+                                selected_exec_off,
+                                weightsbuf,
+                                ds4_gpu_tensor_offset(weights),
+                                gate_smem,
+                                2,
+                                false);
+                            if (!ok) stream_expert_split_completed = false;
+                        }
+                    } else if (use_stream_expert_split_deferred) {
                         const bool stream_split_profile =
                             getenv("DS4_METAL_STREAMING_EXPERT_SPLIT_PROFILE") != NULL;
                         const bool stream_split_timing =
