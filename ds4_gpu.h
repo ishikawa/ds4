@@ -83,6 +83,11 @@ int ds4_gpu_commands_active(void);
 int ds4_gpu_dense_m3_timing_start(void);
 int ds4_gpu_dense_m3_timing_snapshot(double *gpu_ms, uint64_t *command_buffers);
 int ds4_gpu_dense_m3_timing_stop(void);
+/* V4.1 DSpark drafter-only diagnostic.  This is armed only by the M3
+ * drafter opt-ins and reports completed command buffers and their GPU spans. */
+int ds4_gpu_v41_dspark_drafter_timing_start(void);
+int ds4_gpu_v41_dspark_drafter_timing_stop(
+        double *gpu_ms, uint32_t *command_buffers);
 #ifdef __APPLE__
 /* V4.1 activation/cache formats. Buffers are float-addressable but the
  * rounded values follow the released BF16/FP8/FP4 inference graph. */
