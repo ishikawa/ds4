@@ -43136,6 +43136,7 @@ static bool ds41_graph_verify_dense_m3_layer(
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) ok = ds41_moe_shared_verify_batch(g, m, l, il);
     if (ok && union_active && union_two_stage) {
+        ok = ds4_gpu_stream_expert_cache_activate_resident_union(il) != 0;
         for (uint32_t row = 0; ok && row < DS41_SPEC_ROWS; row++) {
             ds41_gpu_graph view;
             ds41_spec_bind_row(&view, g, row, start + row);
