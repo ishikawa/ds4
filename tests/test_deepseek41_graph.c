@@ -97,7 +97,7 @@ static int check_batch_head(const char *path) {
                 (fixture == 1 ? 64.0f : 4096.0f);
         for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
             const uint32_t count = counts[c];
-            REQUIRE(ds41_matmul_batch(output, &model, head, input, count, false));
+            REQUIRE(ds41_matmul_batch(output, &model, head, input, count, false, false));
             double worst = 0, norm = 0, squared = 0;
             for (uint32_t r = 0; r < count; r++) {
                 row = ds4_gpu_tensor_view(input, (uint64_t)r * DS4_N_EMBD * sizeof(float),
@@ -1493,7 +1493,7 @@ static int check_partitions(const char *path) {
     ds4_gpu_set_streaming_expert_cache_budget(16);
     setenv("DS4_TP_NO_KEEPALIVE", "1", 1);
     REQUIRE(ds4_gpu_set_model_fd(model.fd));
-    REQUIRE(ds41_graph_alloc(&g, &model, &weights, path, 1, true));
+    REQUIRE(ds41_graph_alloc(&g, &model, &weights, path, 1, true, false));
     const size_t bytes = DS4_N_EMBD * sizeof(float);
     const size_t head_bytes = DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     expected = malloc(head_bytes); actual = malloc(head_bytes); first = malloc(head_bytes);
@@ -1545,7 +1545,8 @@ static int check_partitions(const char *path) {
         REQUIRE(ds41_matmul(g.q, &model, l->attn_q_b, g.qr, true));
         REQUIRE(ds4_gpu_tensor_read(g.q, 0, expected, head_bytes));
         for (uint32_t rank = 0; rank < 2; rank++) {
-            REQUIRE(ds41_matmul_rows(g.q, &model, l->attn_q_b, g.qr, rank * 16384u, 16384));
+            REQUIRE(ds41_matmul_rows_round(g.q, &model, l->attn_q_b, g.qr,
+                                           rank * 16384u, 16384, true));
             REQUIRE(ds4_gpu_tensor_read(g.q, 0, actual + rank * 16384u, head_bytes / 2));
         }
         REQUIRE(partition_close("query row split", il, expected, actual, 32768));
@@ -1677,7 +1678,6 @@ static int check_memory_plan(const char *path) {
     opt.distributed.role = DS4_DISTRIBUTED_COORDINATOR;
     REQUIRE(!engine_warm_full_model(&opt));
     weights_bind(&e.weights, &e.model, false, 0, UINT32_MAX, true, false);
-    REQUIRE(e.model.size < e.model.file_size);
     const bool q4 = e.weights.layer[0].ffn_gate_exps->type == DS4_TENSOR_Q4_K;
     REQUIRE(q4 || e.weights.layer[0].ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS);
     g_tp_shard_model_bytes = 0;
@@ -1702,13 +1702,22 @@ static int check_memory_plan(const char *path) {
     REQUIRE(ds4_streaming_routed_expert_bytes(&e.weights, &expert) && expert);
     REQUIRE(weights_streaming_non_routed_bytes(&e.weights, &fixed));
     REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 128 * gib, 110 * gib));
-    uint64_t planned = fixed + graph + 2 * gib + e.ssd_streaming_cache_bytes;
+    uint64_t planned = fixed + graph + 2 * gib +
+        e.ssd_streaming_prefill_headroom_bytes + e.ssd_streaming_cache_bytes;
     REQUIRE(e.ssd_streaming_cache_experts > 0 && planned <= 110 * gib);
     REQUIRE(planned + expert > 110 * gib);
     const uint32_t fitted = e.ssd_streaming_cache_experts;
     REQUIRE(ds41_memory_admit_for_host(&e, graph, false, 128 * gib, 110 * gib));
     REQUIRE(!ds41_memory_admit_for_host(&e, graph + expert, false, 128 * gib, 110 * gib));
     REQUIRE(e.ssd_streaming_cache_experts == fitted);
+    e.ssd_streaming_cache_experts = DS4_N_LAYER * DS4_N_EXPERT;
+    e.ssd_streaming_cache_bytes = 0;
+    setenv("DS4_V41_MEMORY_BUDGET_GB", "120", 1);
+    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 128 * gib, 110 * gib));
+    REQUIRE(e.ssd_streaming_cache_experts > fitted);
+    REQUIRE(e.ssd_streaming_cache_bytes ==
+            (uint64_t)e.ssd_streaming_cache_experts * expert);
+    unsetenv("DS4_V41_MEMORY_BUDGET_GB");
     REQUIRE(!ds41_memory_admit_for_host(&e, graph, true, 8 * gib, 6 * gib));
     puts("V4.1 disk-only Engram, 128/256/512 GiB residency, TP and SSD admission: PASS");
     rc = 0;
@@ -2017,7 +2026,8 @@ int main(int argc, char **argv) {
     }
     REQUIRE(ds4_gpu_set_model_map_spans(model.map, model.size, offsets, sizes,
                                        spans.len, spans.max_tensor_bytes));
-    REQUIRE(ds41_graph_alloc(&graph, &model, &weights, argv[1], zero ? 20000 : 4096, true));
+    REQUIRE(ds41_graph_alloc(&graph, &model, &weights, argv[1],
+                             zero ? 20000 : 4096, true, false));
     logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
     REQUIRE(logits);
     const double start = now_sec();

@@ -5053,6 +5053,17 @@ static uint32_t ds4_streaming_cache_experts_for_byte_budget(
     return ds4_ssd_cache_experts_for_byte_budget(bytes, per_expert_bytes);
 }
 
+static uint64_t ds4_v41_memory_budget_override_bytes(void) {
+    const char *value = getenv("DS4_V41_MEMORY_BUDGET_GB");
+    if (!value || !value[0]) return 0;
+    char *end = NULL;
+    const double gib = strtod(value, &end);
+    if (end == value || *end != '\0' || gib <= 0.0 || gib > 1024.0) {
+        return 0;
+    }
+    return (uint64_t)(gib * 1073741824.0);
+}
+
 #ifndef DS4_NO_GPU
 static ds4_gpu_stream_expert_table graph_stream_expert_table_make(
         const ds4_model         *model,
@@ -5101,6 +5112,9 @@ static uint64_t ds4_streaming_manual_cache_safe_bytes(
      */
     uint64_t target = recommended > UINT64_MAX / 7ull ?
         UINT64_MAX : (recommended * 7ull) / 8ull;
+    const uint64_t override = DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 ?
+        ds4_v41_memory_budget_override_bytes() : 0;
+    if (override != 0) target = override;
     const ds4_context_memory ctx_mem =
         ds4_context_memory_estimate_with_prefill_mode(backend,
                                                       ctx_size,
@@ -68300,12 +68314,14 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                                       bool fit_cache, uint64_t host,
                                       uint64_t recommended) {
     const uint64_t gib = UINT64_C(1073741824);
-    uint64_t budget = host / 8u * 7u;
     if (!host || !recommended) {
         fprintf(stderr, "ds4: cannot determine a safe V4.1 memory budget\n");
         return false;
     }
-    if (budget > recommended) budget = recommended;
+    const uint64_t override = ds4_v41_memory_budget_override_bytes();
+    uint64_t budget = override != 0 ? override : host / 8u * 7u;
+    if (budget > host) budget = host;
+    if (override == 0 && budget > recommended) budget = recommended;
     uint64_t weights = g_tp_shard_model_bytes ? g_tp_shard_model_bytes : e->model.size;
     if (e->ssd_streaming && !weights_streaming_non_routed_bytes(&e->weights, &weights)) return false;
     weights = ds4_add_sat_u64(weights, e->vision_model.size);
@@ -68344,7 +68360,7 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         fprintf(stderr, "ds4: V4.1 SSD cache fitted from %u to %u experts for context/runtime headroom\n",
                 e->ssd_streaming_cache_experts, count);
         e->ssd_streaming_cache_experts = count;
-        e->ssd_streaming_cache_bytes = (uint64_t)count * expert + e->ssd_streaming_prefill_headroom_bytes;
+        e->ssd_streaming_cache_bytes = (uint64_t)count * expert;
     }
     return true;
 }
