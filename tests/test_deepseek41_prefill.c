@@ -14,7 +14,19 @@ static int check_dispatch(void) {
         .carry_cap = 32768, .streaming = true, .tp_world = 1};
     const uint32_t half = DS4_N_LAYER * DS4_N_EXPERT / 2u;
     const uint32_t saved = ds4_gpu_stream_expert_cache_configured_count();
+    const char *seed_cap_value = getenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER");
+    char *saved_seed_cap = seed_cap_value ? strdup(seed_cap_value) : NULL;
+    CHECK(!seed_cap_value || saved_seed_cap);
+    CHECK(unsetenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER") == 0);
     ds4_gpu_set_ssd_streaming(true);
+    CHECK(ds41_prefill_seed_target(DS4_N_LAYER * 64u) == 64u);
+    CHECK(setenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER", "24", 1) == 0);
+    CHECK(ds41_prefill_seed_target(DS4_N_LAYER * 64u) == 24u);
+    CHECK(setenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER", "0", 1) == 0);
+    CHECK(ds41_prefill_seed_target(DS4_N_LAYER * 64u) == 0u);
+    CHECK(setenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER", "invalid", 1) == 0);
+    CHECK(ds41_prefill_seed_target(DS4_N_LAYER * 64u) == 64u);
+    CHECK(unsetenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER") == 0);
     const uint32_t remaining[] = {1, 31, 32, 33, 127, 128, 255, 256, 257, 511, 512, 513, 1023, 1024,
         2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193,
         16383, 16384, 16385, 32767, 32768, 32769, 65536};
@@ -75,6 +87,12 @@ static int check_dispatch(void) {
     puts("V4.1 cold/warm and TP prefill dispatch, tile boundaries and debug/imatrix fallbacks: PASS");
     rc = 0;
 done:
+    if (saved_seed_cap) {
+        setenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER", saved_seed_cap, 1);
+        free(saved_seed_cap);
+    } else {
+        unsetenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER");
+    }
     ds4_gpu_set_streaming_expert_cache_budget(saved);
     ds4_gpu_set_ssd_streaming(false);
     return rc;
