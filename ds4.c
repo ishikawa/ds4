@@ -42389,6 +42389,67 @@ static uint32_t ds41_encoder_chunk_cap(const ds41_gpu_graph *g, uint32_t count) 
     return g->prefill_cap;
 }
 
+typedef struct {
+    uint32_t first;
+    uint32_t warm_offset;
+    uint32_t warm_count;
+} ds41_decoder_suffix_plan;
+
+static bool ds41_short_decoder_suffix_requested(void) {
+    const char *value = getenv("DS4_METAL_V41_SHORT_DECODER_SUFFIX");
+    return value && !strcmp(value, "1") &&
+        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+}
+
+static bool ds41_short_decoder_suffix_enabled(
+        const ds41_gpu_graph *g,
+        uint32_t total_count) {
+    return g && ds41_short_decoder_suffix_requested() &&
+        total_count >= 4096u && total_count < 8192u &&
+        total_count <= g->carry_cap && g->tp_world == 1;
+}
+
+static ds41_decoder_suffix_plan ds41_decoder_suffix_make_plan(
+        uint32_t total_count,
+        uint32_t il) {
+    ds41_decoder_suffix_plan plan = {0};
+    if (il < 20u || il >= DS4_N_LAYER) return plan;
+    uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+    if (needed > total_count) needed = total_count;
+    plan.first = total_count - needed;
+    plan.warm_count = plan.first < 127u ? plan.first : 127u;
+    plan.warm_offset = plan.first - plan.warm_count;
+    return plan;
+}
+
+static ds41_decoder_suffix_plan ds41_short_decoder_suffix_make_plan(
+        uint32_t total_count,
+        uint32_t il) {
+    ds41_decoder_suffix_plan plan = {0};
+    if (il < 20u || il >= DS4_N_LAYER) return plan;
+    /* The next decode and DSpark capture persist the last 128 rows, not only
+     * the final logit.  Expand that whole frontier by 127 dependencies per
+     * remaining decoder layer.  The established 8K+ logit-only plan remains
+     * unchanged; this wider plan belongs only to the short opt-in. */
+    uint32_t needed = 128u + (DS4_N_LAYER - 1u - il) * 127u;
+    if (needed < 512u) needed = 512u;
+    if (needed > total_count) needed = total_count;
+    plan.first = total_count - needed;
+    plan.warm_count = plan.first < 127u ? plan.first : 127u;
+    plan.warm_offset = plan.first - plan.warm_count;
+    return plan;
+}
+
+static ds41_decoder_suffix_plan ds41_decoder_suffix_align_plan(
+        ds41_decoder_suffix_plan plan,
+        uint32_t quantum) {
+    if (!quantum || !plan.first) return plan;
+    plan.first -= plan.first % quantum;
+    plan.warm_count = plan.first < 127u ? plan.first : 127u;
+    plan.warm_offset = plan.first - plan.warm_count;
+    return plan;
+}
+
 /* Process rows in causal order within each layer. Selection/candidate rows
  * travel down the stack with their token, while only source layers append KV.
  * A failed partial chunk cannot be snapshotted: its layers have different
@@ -42400,7 +42461,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                               bool encoder_only, bool resume_encoder) {
     const uint32_t encoder_chunk = ds41_encoder_chunk_cap(g, total_count);
     const bool wide = total_count > encoder_chunk;
-    if ((!g->valid && !resume_encoder) || !total_count || (wide && total_count > g->carry_cap) ||
+    const bool decoder_suffix_disabled =
+        getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX") != NULL;
+    const bool short_decoder_suffix =
+        ds41_short_decoder_suffix_enabled(g, total_count);
+    const bool carry_sweep = wide || short_decoder_suffix;
+    if ((!g->valid && !resume_encoder) || !total_count ||
+        (carry_sweep && total_count > g->carry_cap) ||
         total_count > g->ctx - g->pos || g->imatrix || !ds41_tp_batch_enabled(g))
         return false;
     const bool profile = getenv("DS4_METAL_GRAPH_PREFILL_PROFILE") != NULL;
@@ -42410,9 +42477,12 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     const bool batch_core = batch_attention && !getenv("DS4_METAL_DISABLE_V41_BATCH_CORE");
     const bool batch_hc = batch_attention && batch_moe &&
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC");
-    const bool decoder_suffix = wide && total_count >= 8192u &&
-        !getenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX");
+    const bool decoder_suffix =
+        (short_decoder_suffix || (wide && total_count >= 8192u)) &&
+        !decoder_suffix_disabled;
     if ((encoder_only || resume_encoder) && !decoder_suffix) return false;
+    if (short_decoder_suffix && decoder_suffix)
+        fprintf(stderr, "ds4: V4.1 exact short decoder suffix rows=%u\n", total_count);
     uint32_t (*ids)[2][DS4_ENGRAM_COLS] = g->prefill_ids;
     ds4_engram_history next_history = g->history;
     if (!ds41_hash_tokens(g, &next_history, tokens, total_count, &ids[0][0][0]))
@@ -42462,14 +42532,42 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         }
         const double t_map = profile ? now_sec() : 0;
         uint32_t first = 0;
+        bool dspark_capture_preloaded = false;
         if (ok && decoder_suffix && il >= 20u) {
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
-            first = total_count - needed;
-            if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
-                first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
+            const ds41_decoder_suffix_plan plan =
+                short_decoder_suffix ?
+                ds41_short_decoder_suffix_make_plan(total_count, il) :
+                ds41_decoder_suffix_make_plan(total_count, il);
+            ds41_decoder_suffix_plan execution = plan;
+            if (short_decoder_suffix && wide)
+                execution = ds41_decoder_suffix_align_plan(execution, encoder_chunk);
+            first = execution.first;
+            if (ok && execution.warm_count)
+                ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
+                    execution.warm_offset, execution.warm_count, false,
+                    batch_hc, batch_attention, cancel, cancel_ud);
+            /* The established 8K+ logit suffix shrinks its final target-layer
+             * input below DSpark's persisted capture frontier.  That frontier
+             * is already present in carry from the preceding layer; preload it
+             * before the one-row final suffix instead of changing the suffix
+             * plan or its matrix partitions. */
+            const int capture_slot = batch_hc && g->dspark ?
+                metal_graph_dspark_target_slot(g->dspark, il) : -1;
+            uint32_t capture_rows = g->dspark ? g->dspark->prefill_cap : 0u;
+            if (capture_rows > total_count) capture_rows = total_count;
+            if (ok && capture_slot >= 0 && total_count - first < capture_rows) {
+                ok = ds4_gpu_begin_commands() != 0;
+                if (ok) ok = ds41_carry_copy(g, total_count - capture_rows,
+                                              capture_rows, false);
+                if (ok) ok = metal_graph_dspark_capture_hc_rows_from(
+                    g->dspark, g->batch.residual, (uint32_t)capture_slot,
+                    initial_start + total_count - capture_rows, capture_rows);
+                if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+                dspark_capture_preloaded = ok;
+            }
         }
         /* Keep the decoder suffix's established matrix partitions; unlike
          * the encoder, its shrinking tail is not aligned to large tiles. */
@@ -42508,7 +42606,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                         ds41_embed(g, m, w, g->rows_view[t].residual, g->rows_view[t].x,
                                     tokens[off + t], start + t);
                 }
-            } else if (wide) {
+            } else if (wide || (short_decoder_suffix && il >= 20u)) {
                 if (ok) ok = ds41_carry_copy(g, off, count, false);
             }
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
@@ -42546,7 +42644,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                 ok = ds4_gpu_tensor_copy(g->batch.engram_rows, 0, g->engram_prefetch,
                                          off * bytes, count * bytes) != 0;
             }
-            if (ok && batch_hc && g->dspark && off + count == total_count) {
+            if (ok && batch_hc && g->dspark && !dspark_capture_preloaded &&
+                off + count == total_count) {
                 const int capture_slot = metal_graph_dspark_target_slot(g->dspark, il);
                 if (capture_slot >= 0) {
                     uint32_t capture_rows = total_count < g->dspark->prefill_cap ?
@@ -42642,7 +42741,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             }
             DS41_STAGE("hc expand");
 #undef DS41_STAGE
-            if (ok && wide && il + 1u < DS4_N_LAYER) {
+            if (ok && il + 1u < DS4_N_LAYER &&
+                (wide || (short_decoder_suffix && il >= 19u))) {
                 ok = ds41_carry_copy(g, off, count, true);
             }
             const double t_encoded = profile ? now_sec() : 0;
