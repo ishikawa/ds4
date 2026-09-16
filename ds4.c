@@ -42116,14 +42116,29 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model 
     return true;
 }
 
+/* Bound the prefill copy cost without reducing the cache capacity available
+ * to later decode traffic. The default preserves the configured cache share. */
+static uint32_t ds41_prefill_seed_target(uint32_t configured_count) {
+    uint32_t target = configured_count / DS4_N_LAYER;
+    if (target > DS4_N_EXPERT) target = DS4_N_EXPERT;
+    const char *cap_env = getenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER");
+    if (cap_env && cap_env[0]) {
+        char *end = NULL;
+        const unsigned long cap = strtoul(cap_env, &end, 10);
+        if (end != cap_env && *end == '\0' && cap <= UINT32_MAX && target > cap)
+            target = (uint32_t)cap;
+    }
+    return target;
+}
+
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
                              const ds4_layer_weights *l, uint32_t il, uint32_t count) {
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
     if (!g->streaming || getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_CACHE_SEED")) return true;
-    uint32_t target = ds4_gpu_stream_expert_cache_configured_count() / DS4_N_LAYER;
-    if (target > DS4_N_EXPERT) target = DS4_N_EXPERT;
+    const uint32_t target = ds41_prefill_seed_target(
+        ds4_gpu_stream_expert_cache_configured_count());
     if (!target) return true;
     const int32_t *selected = ds4_gpu_tensor_contents(g->batch.selected);
     if (!selected) return false;
