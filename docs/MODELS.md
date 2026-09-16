@@ -88,6 +88,22 @@ Large SSD prefills process layers in wide batches, overlapping computation
 with the next layer's reads. Short appends keep using the expert cache.
 Resident and TP inference also batch continued prefills automatically.
 
+On single-Mac Metal, the experimental opt-in
+`DS4_METAL_V41_SHORT_DECODER_SUFFIX=1` applies the decoder's exact bounded
+dependency suffix to layer-major SSD prefills from 4096 through 8191 tokens.
+The encoder still publishes every key; each decoder layer rebuilds its
+127-token sliding window and evaluates only the rows that can reach the final
+128-row persisted frontier. The implementation keeps at least 512 decoder rows
+and, for wide prefills, rounds the suffix start down to the existing 2048-row
+chunk boundary so Metal matrix partitions stay byte-identical to the control.
+Values other than exactly `1` are disabled. The established 8192+ suffix plan
+and matrix partitions are unchanged; a final-frontier preload also fixes its
+DSpark capture when the logit suffix narrows below 128 rows. Prefills below 4096
+tokens keep their existing dispatch policy. The diagnostic fallback
+`DS4_METAL_DISABLE_V41_DECODER_SUFFIX` overrides this opt-in, including its
+carry path. Validate output and performance on your model and machine before
+adopting this experimental flag.
+
 For concurrent serving, see [session batching](SERVER.md#multiple-sessions).
 Each slot needs its own context memory; start with `--ctx 4096` before
 increasing both context and slot count. DSpark, pipeline execution and
