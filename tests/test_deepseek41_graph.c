@@ -823,7 +823,8 @@ static int check_wide_prefill(const char *path, const char *prompt_path,
     const uint32_t context = wide_case ? 34816u : 24576u;
     ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
         .context_size = context, .power_percent = 100, .ssd_streaming = true,
-        .ssd_streaming_cache_bytes = UINT64_C(64) << 30};
+        /* Leave room for the control and candidate graphs on a 64 GiB host. */
+        .ssd_streaming_cache_bytes = UINT64_C(24) << 30};
     if (!decoder_cancel && !control_env) setenv("DS4_METAL_DISABLE_V41_DECODER_SUFFIX", "1", 1);
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &prompt_bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
@@ -860,7 +861,7 @@ static int check_wide_prefill(const char *path, const char *prompt_path,
         REQUIRE(ds4_gpu_tensor_contents(a->batch.experts) != ds4_gpu_tensor_contents(a->batch.q));
         REQUIRE(ds4_gpu_tensor_contents(a->batch.engram_kv) != ds4_gpu_tensor_contents(a->batch.q));
     }
-    const uint32_t counts[] = {4096, 6144, wide_case ? 16384u : 8192u};
+    const uint32_t counts[] = {4096, 6144, wide_case ? 16385u : 8193u};
     for (size_t i = 0; !cancel_only && i < sizeof(counts) / sizeof(*counts); i++) {
         const uint32_t start = a->pos, count = counts[i];
         double t0 = now_sec();
