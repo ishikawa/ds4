@@ -42131,6 +42131,15 @@ static uint32_t ds41_prefill_seed_target(uint32_t configured_count) {
     return target;
 }
 
+static bool ds41_prefill_seed_tile(uint32_t first, uint32_t off,
+                                   uint32_t count, uint32_t total_count) {
+    if (first > off || off > total_count || count > total_count - off) return false;
+    const uint32_t tail = total_count - off - count;
+    /* A tiny final tile has too little routing diversity to warm the decode
+     * cache. Seed once from the preceding tile when this layer has one. */
+    return tail ? tail < 32u : count >= 32u || off == first;
+}
+
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
  * routes take precedence over the rest of the prompt's popular experts. */
 static bool ds41_prefill_seed(ds41_gpu_graph *g, const ds4_model *m,
@@ -42204,8 +42213,10 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     if (remaining < minimum) return 1;
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
-        const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
-        return count - count % 2048u;
+        /* The carry allocation, unlike an encoder tile, can hold the final
+         * partial tile. Preserve alignment only at an actual carry boundary. */
+        return remaining <= g->carry_cap ? remaining :
+            g->carry_cap - g->carry_cap % 2048u;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     return remaining < tail_cap ? remaining : tail_cap;
@@ -42801,7 +42812,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
-            if (ok && !encoder_only && off + count == total_count)
+            if (ok && !encoder_only &&
+                ds41_prefill_seed_tile(first, off, count, total_count))
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
