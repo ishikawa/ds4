@@ -42131,13 +42131,13 @@ static uint32_t ds41_prefill_seed_target(uint32_t configured_count) {
     return target;
 }
 
-static bool ds41_prefill_seed_tile(uint32_t off, uint32_t count,
-                                   uint32_t total_count) {
-    if (off > total_count || count > total_count - off) return false;
+static bool ds41_prefill_seed_tile(uint32_t first, uint32_t off,
+                                   uint32_t count, uint32_t total_count) {
+    if (first > off || off > total_count || count > total_count - off) return false;
     const uint32_t tail = total_count - off - count;
     /* A tiny final tile has too little routing diversity to warm the decode
-     * cache. Seed once from the preceding tile instead. */
-    return tail ? tail < 32u : count >= 32u;
+     * cache. Seed once from the preceding tile when this layer has one. */
+    return tail ? tail < 32u : count >= 32u || off == first;
 }
 
 /* Seed from the current mapped layer, avoiding a second disk pass. Recent
@@ -42813,7 +42813,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (g->tp_world == 2 && ds4_gpu_tp_failed()) ok = false;
             const double t_done = profile ? now_sec() : 0;
             if (ok && !encoder_only &&
-                ds41_prefill_seed_tile(off, count, total_count))
+                ds41_prefill_seed_tile(first, off, count, total_count))
                 ok = ds41_prefill_seed(g, m, &w->layer[il], il, count);
             if (engram_prefetched && ds41_engram_layer(il) && off + count == total_count &&
                 !ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;

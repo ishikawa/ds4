@@ -18,11 +18,12 @@ static int check_dispatch(void) {
     char *saved_seed_cap = seed_cap_value ? strdup(seed_cap_value) : NULL;
     CHECK(!seed_cap_value || saved_seed_cap);
     CHECK(unsetenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER") == 0);
-    CHECK(!ds41_prefill_seed_tile(0, 4096, 8193));
-    CHECK(ds41_prefill_seed_tile(4096, 4096, 8193));
-    CHECK(!ds41_prefill_seed_tile(8192, 1, 8193));
-    CHECK(!ds41_prefill_seed_tile(0, 4096, 12288));
-    CHECK(ds41_prefill_seed_tile(8192, 4096, 12288));
+    CHECK(!ds41_prefill_seed_tile(0, 0, 4096, 8193));
+    CHECK(ds41_prefill_seed_tile(0, 4096, 4096, 8193));
+    CHECK(!ds41_prefill_seed_tile(0, 8192, 1, 8193));
+    CHECK(ds41_prefill_seed_tile(8192, 8192, 1, 8193));
+    CHECK(!ds41_prefill_seed_tile(0, 0, 4096, 12288));
+    CHECK(ds41_prefill_seed_tile(0, 8192, 4096, 12288));
     ds4_gpu_set_ssd_streaming(true);
     CHECK(ds41_prefill_seed_target(DS4_N_LAYER * 64u) == 64u);
     CHECK(setenv("DS4_METAL_V41_MAX_PREFILL_CACHE_SEED_EXPERTS_PER_LAYER", "24", 1) == 0);
