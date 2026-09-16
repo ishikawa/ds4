@@ -10636,6 +10636,22 @@ static int kv_cache_chat_anchor_pos(const kv_disk_cache *kc,
     return ds4_kvstore_chat_anchor_pos(kc, prompt, user_token_id, assistant_token_id);
 }
 
+static int kv_cache_cold_store_len(const kv_disk_cache *kc,
+                                   const ds4_tokens *prompt,
+                                   int user_token_id,
+                                   int assistant_token_id,
+                                   bool defer_anchor) {
+    const int anchor = kv_cache_chat_anchor_pos(kc, prompt,
+                                                user_token_id,
+                                                assistant_token_id);
+    const int store_len = anchor >= kc->opt.min_tokens ?
+                          anchor : kv_cache_store_len(kc, prompt->len);
+    /* V4.1 SSD streaming pays a full model sweep at every synchronization
+     * boundary. Save the completed prompt instead of interrupting prefill at
+     * a reusable chat anchor; live continuations still retain their prefix. */
+    return defer_anchor && store_len < prompt->len ? prompt->len : store_len;
+}
+
 
 static int kv_cache_continued_store_target(const kv_disk_cache *kc, int live_tokens) {
     return ds4_kvstore_continued_store_target(kc, live_tokens);
@@ -12847,11 +12863,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         s->kv.opt.cold_max_tokens > 0 &&
         prompt_for_sync->len <= s->kv.opt.cold_max_tokens)
     {
-        const int anchor = kv_cache_chat_anchor_pos(&s->kv, prompt_for_sync,
-                                                    ds4_token_user(s->engine),
-                                                    ds4_token_assistant(s->engine));
-        cold_store_len = anchor >= s->kv.opt.min_tokens ?
-                         anchor : kv_cache_store_len(&s->kv, prompt_for_sync->len);
+        cold_store_len = kv_cache_cold_store_len(
+            &s->kv, prompt_for_sync,
+            ds4_token_user(s->engine), ds4_token_assistant(s->engine),
+            ds4_engine_is_deepseek41(s->engine));
     }
     int suppressed_continued_last = -1;
     if (cold_store_len >= s->kv.opt.min_tokens) {
@@ -19343,6 +19358,27 @@ static void test_kv_cache_chat_anchor_ignores_multiturn_tail(void) {
     ds4_tokens_free(&prompt);
 }
 
+static void test_kv_cache_cold_store_defers_deepseek41_anchor(void) {
+    const int user = 9001;
+    const int assistant = 9002;
+    kv_disk_cache kc = {0};
+    kc.opt = kv_cache_default_options();
+    kc.opt.min_tokens = 2;
+
+    ds4_tokens prompt = {0};
+    ds4_tokens_push(&prompt, 1);
+    ds4_tokens_push(&prompt, 2);
+    ds4_tokens_push(&prompt, user);
+    ds4_tokens_push(&prompt, 3);
+    ds4_tokens_push(&prompt, assistant);
+    ds4_tokens_push(&prompt, 4);
+
+    TEST_ASSERT(kv_cache_cold_store_len(&kc, &prompt, user, assistant, false) == 2);
+    TEST_ASSERT(kv_cache_cold_store_len(&kc, &prompt, user, assistant, true) == prompt.len);
+
+    ds4_tokens_free(&prompt);
+}
+
 static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -20822,6 +20858,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_store_len_uses_configured_boundary();
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
+    test_kv_cache_cold_store_defers_deepseek41_anchor();
     test_kv_cache_continued_uses_aligned_frontiers();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
