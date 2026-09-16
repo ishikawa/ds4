@@ -42,6 +42,39 @@ static void test_forced_outcome_contract(void) {
     assert(ds41_dspark_forced_accepted_draft(NULL, 1) == 1u);
 }
 
+static void test_stop_frontier_contract(void) {
+    ds4_engine engine;
+    memset(&engine, 0, sizeof(engine));
+    engine.vocab.eos_id = 1;
+    engine.vocab.think_start_id = 7;
+    engine.vocab.think_end_id = 8;
+
+    uint32_t returned = 99u;
+    const int no_stop[] = {3, 4};
+    assert(ds41_dspark_stop_commit_count(
+        &engine, no_stop, 2u, 1, false, DS4_THINK_HIGH, &returned) == 2u);
+    assert(returned == 2u);
+
+    const int eos_first[] = {1, 4};
+    assert(ds41_dspark_stop_commit_count(
+        &engine, eos_first, 2u, 1, false, DS4_THINK_HIGH, &returned) == 0u);
+    assert(returned == 1u);
+
+    const int eos_second[] = {3, 1};
+    assert(ds41_dspark_stop_commit_count(
+        &engine, eos_second, 2u, 1, false, DS4_THINK_HIGH, &returned) == 1u);
+    assert(returned == 2u);
+    assert(ds41_dspark_stop_commit_count(
+        &engine, eos_second, 2u, 1, true, DS4_THINK_HIGH, &returned) == 2u);
+    assert(returned == 2u);
+
+    const int no_think_control[] = {3, 7};
+    assert(ds41_dspark_stop_commit_count(
+        &engine, no_think_control, 2u, 1, false, DS4_THINK_NONE,
+        &returned) == 1u);
+    assert(returned == 2u);
+}
+
 static void test_cycle_commit_invariants(void) {
     const uint32_t start = 32u;
     for (uint32_t accepted_draft = 0; accepted_draft <= 2u;
@@ -322,6 +355,7 @@ static void test_frontier_restore(void) {
 
 int main(void) {
     test_forced_outcome_contract();
+    test_stop_frontier_contract();
     test_cycle_commit_invariants();
     test_support_cache_row_reservation();
     assert(ds4_gpu_init());

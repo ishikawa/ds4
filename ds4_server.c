@@ -13382,20 +13382,26 @@ decode_again:
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
             if (stop_decode && stop_token >= 0 && !resample) {
-                /* V4.1 recurrent compressor state cannot be truncated after a
-                 * speculative block. Rebuilding the whole retained prefix here
-                 * delays an otherwise complete response by seconds or minutes.
-                 * Drop the reusable live state and let a later request prefill
-                 * on demand; the next stage teaches the verifier to commit the
-                 * exact pre-stop frontier instead. */
+                const int retained_pos = block_start + kept;
                 pthread_mutex_lock(&s->inference_mu);
-                ds4_session_invalidate(slot->session);
+                const bool exact_frontier =
+                    ds4_session_pos(slot->session) == retained_pos;
+                if (!exact_frontier) ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
-                request_live_state_clear(s, slot);
-                terminal_spec_state_discarded = true;
-                trace_event(s, trace_id,
-                            "speculative stop boundary discarded live state: kept=%d discarded=%d",
-                            kept, ntok - kept);
+                if (exact_frontier) {
+                    trace_event(s, trace_id,
+                                "speculative stop boundary retained exact frontier: kept=%d discarded=%d",
+                                kept, ntok - kept);
+                } else {
+                    /* Rebuilding a V4.1 recurrent prefix here delays an
+                     * otherwise complete response by seconds or minutes. Drop
+                     * live reuse and let a later request prefill on demand. */
+                    request_live_state_clear(s, slot);
+                    terminal_spec_state_discarded = true;
+                    trace_event(s, trace_id,
+                                "speculative stop boundary discarded live state: kept=%d discarded=%d",
+                                kept, ntok - kept);
+                }
             } else {
                 /* Logits after a rewind belong to the discarded suffix. Re-eval
                  * the last kept token before sampling under a different mode. */

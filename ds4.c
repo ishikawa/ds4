@@ -40307,6 +40307,26 @@ static uint32_t ds41_dspark_forced_accepted_draft(
     return actual;
 }
 
+static uint32_t ds41_dspark_stop_commit_count(
+        ds4_engine *engine, const int *drafts, uint32_t accepted_draft,
+        int eos_token, bool ignore_eos, ds4_think_mode think_mode,
+        uint32_t *returned_draft) {
+    uint32_t returned = accepted_draft;
+    uint32_t committed = accepted_draft;
+    for (uint32_t i = 0; i < accepted_draft; i++) {
+        const bool stop = ds4_token_is_stop_for_think_mode(
+            engine, drafts[i], think_mode) &&
+            (!ignore_eos || drafts[i] != eos_token);
+        if (stop) {
+            returned = i + 1u;
+            committed = i;
+            break;
+        }
+    }
+    if (returned_draft) *returned_draft = returned;
+    return committed;
+}
+
 static uint64_t ds41_graph_bytes(uint32_t ctx) {
     const ds41_gpu_graph shape = {.ctx = ctx,
         .prefill_cap = ds41_prefill_limit(ctx),
@@ -80693,17 +80713,16 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
     }
     const char *forced = getenv("DS4_V41_DSPARK_SPEC_TEST_OUTCOME");
     accepted_draft = ds41_dspark_forced_accepted_draft(forced, accepted_draft);
-    for (uint32_t i = 0; i < accepted_draft; i++) {
-        const bool stop = (!ignore_eos && drafts[i] == eos_token) ||
-            (ignore_eos && ds4_token_is_stop_for_think_mode(
-                s->engine, drafts[i], think_mode));
-        if (stop) {
-            accepted_draft = i + 1u;
-            break;
-        }
-    }
-    const uint32_t accepted_rows = 1u + accepted_draft;
-    const uint32_t last = accepted_rows - 1u;
+    uint32_t returned_draft = accepted_draft;
+    /* Return a stop token to the caller, but keep the reusable recurrent
+     * frontier immediately before it. The server excludes the stop token from
+     * visible output, so committing it would force ds4_session_rewind() to
+     * invalidate and rebuild the whole V4.1 compressor prefix. */
+    const uint32_t committed_draft = ds41_dspark_stop_commit_count(
+        s->engine, drafts, accepted_draft, eos_token, ignore_eos, think_mode,
+        &returned_draft);
+    const uint32_t committed_rows = 1u + committed_draft;
+    const uint32_t last = committed_rows - 1u;
 
     /* Test outcomes exercise each commit prefix; replay target rows so the
      * forced accepted count does not publish an unverified draft token. */
@@ -80748,7 +80767,7 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
     accepted[0] = first_token;
     int n_accept = 1;
     ok = ds41_spec_frontier_restore(
-        &cycle_frontier, &s->ds41_graph, accepted_rows);
+        &cycle_frontier, &s->ds41_graph, committed_rows);
     if (ok) {
         const uint64_t residual_bytes =
             (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
@@ -80764,7 +80783,7 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
         else if (ds4_gpu_commands_active()) (void)ds4_gpu_end_commands();
     }
     if (ok) ok = metal_graph_dspark_append_v41_target_rows(
-        &s->graph, &s->engine->mtp_model, dw, start, accepted_rows);
+        &s->graph, &s->engine->mtp_model, dw, start, committed_rows);
     if (!ok) {
         const int fallback = ds4_session_eval_v41_dspark_m3_single_row(
             s, first_token, accepted, accepted_cap, err, errlen, start,
@@ -80780,12 +80799,9 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
 
     memcpy(s->logits, rows[last],
            (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
-    for (uint32_t row = 0; row < accepted_rows; row++) {
+    for (uint32_t row = 0; row < committed_rows; row++) {
         const int token = row == 0 ? first_token : drafts[row - 1u];
         token_vec_push(&s->checkpoint, token);
-        if (row != 0 && n_accept < accepted_cap && n_accept < max_tokens) {
-            accepted[n_accept++] = token;
-        }
         if (getenv("DS4_V41_DSPARK_SPEC_VERIFY_LOGIT_HASH")) {
             fprintf(stderr,
                     "ds4: V4.1 target frontier pos=%u token=%d logits_hash=%016llx "
@@ -80797,12 +80813,16 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
                     histories[row].tail[2], s->checkpoint.len);
         }
     }
+    for (uint32_t i = 0; i < returned_draft &&
+         n_accept < accepted_cap && n_accept < max_tokens; i++) {
+        accepted[n_accept++] = drafts[i];
+    }
     s->checkpoint_valid = true;
     s->ds41_graph.history = histories[last];
     s->ds41_graph.dspark_capture_pos = start + last;
     s->ds41_graph.dspark_capture_committed_generation =
         ++s->ds41_graph.dspark_capture_generation;
-    s->graph.dspark_capture_checkpoint_len = start + accepted_rows;
+    s->graph.dspark_capture_checkpoint_len = start + committed_rows;
     ds4_session_dspark_capture_note_checkpoint(s);
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
@@ -80815,15 +80835,15 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
                 "ds4: V4.1 DSpark verify start=%u draft=%d,%d "
                 "accepted_draft=%u accepted_rows=%u bonus=%d rollback=%s "
                 "support_kv=%u target_pos=%u capture_bitwise=%s verify_ms=%.3f\n",
-                start, drafts[0], drafts[1], accepted_draft, accepted_rows,
+                start, drafts[0], drafts[1], returned_draft, committed_rows,
                 bonus,
-                accepted_rows == DS41_SPEC_ROWS ? "none" :
+                committed_rows == DS41_SPEC_ROWS ? "none" :
                     "suffix",
                 s->graph.dspark_cache_len, s->ds41_graph.pos,
                 capture_equal ? "equal" : "different", verify_ms);
     }
     ds4_session_v41_m3_note_cycle(
-        s, accepted_draft, accepted_rows, false, verify_ms,
+        s, returned_draft, committed_rows, false, verify_ms,
         (now_sec() - cycle_t0) * 1000.0);
     free(rows[2]);
     free(rows[1]);
