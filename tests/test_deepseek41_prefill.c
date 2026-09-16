@@ -31,8 +31,8 @@ static int check_dispatch(void) {
         2047, 2048, 2049, 4095, 4096, 4097, 8191, 8192, 8193,
         16383, 16384, 16385, 32767, 32768, 32769, 65536};
     const uint32_t cold[] = {1, 1, 1, 1, 1, 1, 1, 256, 257, 511, 512, 513, 1023, 1024,
-        2047, 2048, 2048, 2048, 4096, 4096, 6144, 8192, 8192,
-        14336, 16384, 16384, 30720, 32768, 32768, 32768};
+        2047, 2048, 2048, 2048, 4096, 4097, 8191, 8192, 8193,
+        16383, 16384, 16385, 32767, 32768, 32768, 32768};
     for (uint32_t cache = half - 1; cache <= half; cache++) {
         ds4_gpu_set_streaming_expert_cache_budget(cache);
         for (uint32_t warm = 0; warm < 2; warm++) {
@@ -80,6 +80,10 @@ static int check_dispatch(void) {
     g.prefill_cap = 1024;
     CHECK(ds41_prefill_count(&g, 4096) == 1024);
     g.prefill_cap = 8192;
+    g.carry_cap = 22528;
+    CHECK(ds41_prefill_count(&g, 21255) == 21255);
+    CHECK(ds41_prefill_count(&g, 22529) == 22528);
+    CHECK(ds41_carry_cap(131072) >= 21255);
     CHECK(ds41_encoder_chunk_cap(&g, 8191) == 2048);
     CHECK(ds41_encoder_chunk_cap(&g, 8192) == 4096);
     CHECK(ds41_encoder_chunk_cap(&g, 16383) == 4096);

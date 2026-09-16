@@ -42204,8 +42204,9 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
     if (remaining < minimum) return 1;
     if (g->carry_cap && remaining >= 4096u &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
-        const uint32_t count = remaining < g->carry_cap ? remaining : g->carry_cap;
-        return count - count % 2048u;
+        /* The carry allocation, unlike an encoder tile, can hold the final
+         * partial tile. Preserve alignment only at an actual carry boundary. */
+        return remaining <= g->carry_cap ? remaining : g->carry_cap;
     }
     const uint32_t tail_cap = g->prefill_cap < 2048u ? g->prefill_cap : 2048u;
     return remaining < tail_cap ? remaining : tail_cap;
