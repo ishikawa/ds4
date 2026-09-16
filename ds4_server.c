@@ -13133,6 +13133,12 @@ decode_again:
                     eos_token, j->req.think_mode,
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
                     err, sizeof(err));
+            } else if (temperature <= 0.0f) {
+                ntok = ds4_session_eval_speculative_argmax_for_think_mode(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, j->req.think_mode,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
             } else {
                 ntok = ds4_session_eval_speculative(
                     slot->session, token, max_tokens - completion,
@@ -13380,16 +13386,44 @@ decode_again:
             }
         }
         if (kept < ntok && !text_stop && !job_cancelled(j) && strcmp(finish, "error")) {
-            /* Logits after a rewind belong to the discarded suffix. Re-eval
-             * the last kept token before sampling under a different mode. */
-            int pos = block_start + kept - (resample ? 1 : 0);
-            if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
-                (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
-                finish = "error";
-                stop_decode = true;
+            if (stop_decode && stop_token >= 0 && !resample) {
+                const int retained_pos = block_start + kept;
+                pthread_mutex_lock(&s->inference_mu);
+                const bool exact_frontier =
+                    ds4_session_pos(slot->session) == retained_pos;
+                pthread_mutex_unlock(&s->inference_mu);
+                if (exact_frontier) {
+                    trace_event(s, trace_id,
+                                "speculative stop boundary retained exact frontier: kept=%d discarded=%d",
+                                kept, ntok - kept);
+                } else {
+                    /* Other speculative decoders may still commit the stop
+                     * token. Preserve their existing rewind semantics and
+                     * live continuation state; only the exact V4.1 frontier
+                     * can skip this work safely. */
+                    if (server_generation_rewind(s, slot, &j->req,
+                                                 retained_pos,
+                                                 err, sizeof(err)) != 0) {
+                        finish = "error";
+                        stop_decode = true;
+                    } else {
+                        trace_event(s, trace_id,
+                                    "speculative stop boundary rewound: kept=%d discarded=%d",
+                                    kept, ntok - kept);
+                    }
+                }
             } else {
-                trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
-                            kept, ntok - kept, resample);
+                /* Logits after a rewind belong to the discarded suffix. Re-eval
+                 * the last kept token before sampling under a different mode. */
+                int pos = block_start + kept - (resample ? 1 : 0);
+                if (server_generation_rewind(s, slot, &j->req, pos, err, sizeof(err)) != 0 ||
+                    (resample && server_eval_token(s, slot, toks[kept - 1], err, sizeof(err)) != 0)) {
+                    finish = "error";
+                    stop_decode = true;
+                } else {
+                    trace_event(s, trace_id, "speculative boundary: kept=%d discarded=%d resample=%d",
+                                kept, ntok - kept, resample);
+                }
             }
         }
         if (stop_decode) break;
