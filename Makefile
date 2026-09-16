@@ -290,7 +290,7 @@ test-rocm:
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test --server
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args
@@ -810,7 +810,7 @@ test: ds4_test ds4_agent_test ds4-eval q4k-dot-test mxfp4-dot-test test-session-
 	./ds4-eval --validate-cases
 	./ds4-eval --self-test-extractors
 	./ds4_agent_test
-	./ds4_test
+	./ds4_test --server
 	./tests/test_layer_pack
 	./tests/test_engine_mgpu_placement
 	./tests/test_gpu_args

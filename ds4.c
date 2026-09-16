@@ -68984,6 +68984,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 fprintf(stderr, "%s\n", ds41_dspark_verify_requested() ?
                         "ds4: V4.1 DSpark k=2 verifier enabled" :
                         "ds4: V4.1 DSpark diagnostic drafter bound; verifier disabled");
+#ifndef DS4_NO_GPU
                 if (ds41_dspark_verify_m3_requested()) {
                     const bool drafter_rows2 =
                         metal_graph_v41_dspark_m3_flag_enabled(
@@ -68998,6 +68999,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         drafter_rows2 ? "2" : "off",
                         drafter_one_cb ? "on" : "off");
                 }
+#endif
             }
             if (e->dspark && !e->quality && !e->dspark_strict) {
                 fprintf(stderr,
