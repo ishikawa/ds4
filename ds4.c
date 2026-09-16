@@ -40315,10 +40315,13 @@ static uint32_t ds41_dspark_stop_commit_count(
     uint32_t committed = accepted_draft;
     for (uint32_t i = 0; i < accepted_draft; i++) {
         const bool stop = ds4_token_is_stop_for_think_mode(
-            engine, drafts[i], think_mode) &&
-            (!ignore_eos || drafts[i] != eos_token);
+            engine, drafts[i], think_mode);
         if (stop) {
-            returned = i + 1u;
+            /* An ignore_eos caller must sample a replacement from the target
+             * distribution, so do not surface a speculative EOS that the
+             * server would interpret as terminal. Ordinary decoding returns
+             * the stop token but keeps it outside the committed frontier. */
+            returned = ignore_eos && drafts[i] == eos_token ? i : i + 1u;
             committed = i;
             break;
         }
@@ -80843,7 +80846,7 @@ static int ds4_session_eval_v41_dspark_speculative_m3(
                 capture_equal ? "equal" : "different", verify_ms);
     }
     ds4_session_v41_m3_note_cycle(
-        s, returned_draft, committed_rows, false, verify_ms,
+        s, committed_draft, committed_rows, false, verify_ms,
         (now_sec() - cycle_t0) * 1000.0);
     free(rows[2]);
     free(rows[1]);
@@ -81865,8 +81868,17 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
                                         int max_tokens, int eos_token,
                                         int *accepted, int accepted_cap,
                                         char *err, size_t errlen) {
+    return ds4_session_eval_speculative_argmax_for_think_mode(
+        s, first_token, max_tokens, eos_token, DS4_THINK_HIGH,
+        accepted, accepted_cap, err, errlen);
+}
+
+int ds4_session_eval_speculative_argmax_for_think_mode(
+        ds4_session *s, int first_token, int max_tokens, int eos_token,
+        ds4_think_mode think_mode,
+        int *accepted, int accepted_cap, char *err, size_t errlen) {
     return ds4_session_eval_speculative_argmax_impl(
-        s, first_token, max_tokens, eos_token, false, DS4_THINK_HIGH,
+        s, first_token, max_tokens, eos_token, false, think_mode,
         accepted, accepted_cap, err, errlen);
 }
 

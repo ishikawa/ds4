@@ -65,8 +65,12 @@ static void test_stop_frontier_contract(void) {
         &engine, eos_second, 2u, 1, false, DS4_THINK_HIGH, &returned) == 1u);
     assert(returned == 2u);
     assert(ds41_dspark_stop_commit_count(
-        &engine, eos_second, 2u, 1, true, DS4_THINK_HIGH, &returned) == 2u);
-    assert(returned == 2u);
+        &engine, eos_second, 2u, 1, true, DS4_THINK_HIGH, &returned) == 1u);
+    assert(returned == 1u);
+
+    assert(ds41_dspark_stop_commit_count(
+        &engine, eos_first, 2u, 1, true, DS4_THINK_HIGH, &returned) == 0u);
+    assert(returned == 0u);
 
     const int no_think_control[] = {3, 7};
     assert(ds41_dspark_stop_commit_count(

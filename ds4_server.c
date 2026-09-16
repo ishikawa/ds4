@@ -13053,7 +13053,6 @@ decode_again:
     bool saw_tool_end = false;
     bool saw_orphan_tool_end = false;
     bool client_stop = false;
-    bool terminal_spec_state_discarded = false;
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
@@ -13130,6 +13129,12 @@ decode_again:
         {
             if (j->req.ignore_eos) {
                 ntok = ds4_session_eval_speculative_argmax_ignoring_eos(
+                    slot->session, token, max_tokens - completion,
+                    eos_token, j->req.think_mode,
+                    toks, (int)(sizeof(toks) / sizeof(toks[0])),
+                    err, sizeof(err));
+            } else if (temperature <= 0.0f) {
+                ntok = ds4_session_eval_speculative_argmax_for_think_mode(
                     slot->session, token, max_tokens - completion,
                     eos_token, j->req.think_mode,
                     toks, (int)(sizeof(toks) / sizeof(toks[0])),
@@ -13386,21 +13391,26 @@ decode_again:
                 pthread_mutex_lock(&s->inference_mu);
                 const bool exact_frontier =
                     ds4_session_pos(slot->session) == retained_pos;
-                if (!exact_frontier) ds4_session_invalidate(slot->session);
                 pthread_mutex_unlock(&s->inference_mu);
                 if (exact_frontier) {
                     trace_event(s, trace_id,
                                 "speculative stop boundary retained exact frontier: kept=%d discarded=%d",
                                 kept, ntok - kept);
                 } else {
-                    /* Rebuilding a V4.1 recurrent prefix here delays an
-                     * otherwise complete response by seconds or minutes. Drop
-                     * live reuse and let a later request prefill on demand. */
-                    request_live_state_clear(s, slot);
-                    terminal_spec_state_discarded = true;
-                    trace_event(s, trace_id,
-                                "speculative stop boundary discarded live state: kept=%d discarded=%d",
-                                kept, ntok - kept);
+                    /* Other speculative decoders may still commit the stop
+                     * token. Preserve their existing rewind semantics and
+                     * live continuation state; only the exact V4.1 frontier
+                     * can skip this work safely. */
+                    if (server_generation_rewind(s, slot, &j->req,
+                                                 retained_pos,
+                                                 err, sizeof(err)) != 0) {
+                        finish = "error";
+                        stop_decode = true;
+                    } else {
+                        trace_event(s, trace_id,
+                                    "speculative stop boundary rewound: kept=%d discarded=%d",
+                                    kept, ntok - kept);
+                    }
                 }
             } else {
                 /* Logits after a rewind belong to the discarded suffix. Re-eval
@@ -13701,8 +13711,7 @@ decode_again:
                  parsed_reasoning, &parsed_calls, now_sec() - t0);
 
     if (j->req.api == API_RESPONSES) {
-        if (!terminal_spec_state_discarded &&
-            strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
+        if (strcmp(final_finish, "error") && strcmp(final_finish, "length")) {
             /* Store the post-turn visible transcript plus the live token
              * frontier.  The next Responses request may replay only this
              * visible surface, while the real session also contains hidden
@@ -13749,7 +13758,7 @@ decode_again:
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
         thinking_live_clear(s, slot);
-    } else if (!terminal_spec_state_discarded && !parsed_calls.len &&
+    } else if (!parsed_calls.len &&
                should_remember_thinking_checkpoint(&j->req, &thinking, final_finish)) {
         remember_thinking_checkpoint(s, slot, j, ctx_span, trace_id,
                                      parsed_content ? parsed_content : "");
