@@ -13796,6 +13796,14 @@ uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return budget;
 }
 
+void ds4_gpu_grow_streaming_expert_cache_budget(uint32_t experts) {
+    if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+        experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
+    }
+    const uint32_t current = ds4_gpu_stream_expert_cache_configured_count();
+    if (experts > current) g_stream_expert_cache_budget_override = experts;
+}
+
 uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
 }

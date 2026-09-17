@@ -58335,6 +58335,73 @@ static DS4_MAYBE_UNUSED int generate_glm_metal_first_token(
     return 0;
 }
 
+static void ds4_glm_grow_streaming_cache_after_prefill(
+        const ds4_weights *weights,
+        bool               ssd_streaming,
+        uint64_t           ssd_streaming_cache_bytes,
+        uint64_t           ssd_streaming_prefill_headroom_bytes) {
+    /*
+     * Decode is SSD-read bound, so the prefill expert headroom is worth more
+     * as extra dynamic cache once prefill is done. Both ROCm and Metal use
+     * the headroom only to keep transient prefill expert residency outside
+     * the steady-state selected-expert cache. Opt out with the backend-
+     * specific *_GROW_CACHE_AFTER_PREFILL=0 setting.
+     */
+#ifdef DS4_ROCM_BUILD
+    const char *grow_cache_env =
+        getenv("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
+    const char *grow_cache_backend = "ROCm";
+#elif defined(__APPLE__)
+    const char *grow_cache_env =
+        getenv("DS4_METAL_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
+    const char *grow_cache_backend = "Metal";
+#else
+    const char *grow_cache_env = "0";
+    const char *grow_cache_backend = "GPU";
+#endif
+    if (getenv("DS4_METAL_STREAMING_EXPERT_PROFILE_SUMMARY") != NULL) {
+        fprintf(stderr,
+                "ds4: %s GLM post-prefill cache grow check: streaming=%s "
+                "cache=%.2f GiB headroom=%.2f GiB setting=%s\n",
+                grow_cache_backend,
+                ssd_streaming ? "on" : "off",
+                (double)ssd_streaming_cache_bytes / 1073741824.0,
+                (double)ssd_streaming_prefill_headroom_bytes / 1073741824.0,
+                grow_cache_env ? grow_cache_env : "auto");
+    }
+    if (!ssd_streaming ||
+        ssd_streaming_cache_bytes == 0 ||
+        ssd_streaming_prefill_headroom_bytes == 0 ||
+        (grow_cache_env != NULL && !glm_graph_env_truthy(grow_cache_env))) {
+        return;
+    }
+
+    uint64_t budget_bytes = 0;
+    uint64_t per_expert_bytes = 0;
+    if (ssd_streaming_cache_bytes <=
+        UINT64_MAX - ssd_streaming_prefill_headroom_bytes) {
+        budget_bytes =
+            ssd_streaming_cache_bytes + ssd_streaming_prefill_headroom_bytes;
+    }
+    const uint32_t grown_budget =
+        ds4_streaming_cache_experts_for_byte_budget(weights,
+                                                    budget_bytes,
+                                                    &per_expert_bytes);
+    const uint32_t current_budget =
+        ds4_gpu_stream_expert_cache_configured_count();
+    if (grown_budget > current_budget) {
+        ds4_gpu_grow_streaming_expert_cache_budget(grown_budget);
+        fprintf(stderr,
+                "ds4: %s GLM streaming expert cache grew after prefill: "
+                "%u -> %u experts (%.2f GiB)\n",
+                grow_cache_backend,
+                current_budget,
+                grown_budget,
+                (double)((uint64_t)grown_budget * per_expert_bytes) /
+                    1073741824.0);
+    }
+}
+
 static int generate_glm_metal_argmax(
         const ds4_model   * model,
         const ds4_vocab   * vocab,
@@ -58434,46 +58501,11 @@ static int generate_glm_metal_argmax(
         glm_graph_free(&g);
         return 1;
     }
-#ifdef DS4_ROCM_BUILD
-    /*
-     * Decode is SSD-read bound, so the prefill expert headroom is worth more
-     * as extra dynamic cache once prefill is done.  Opt out with
-     * DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=0.
-     */
-    const char *grow_cache_env =
-        getenv("DS4_ROCM_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL");
-    if (ssd_streaming &&
-        ssd_streaming_cache_bytes != 0 &&
-        ssd_streaming_prefill_headroom_bytes != 0 &&
-        (grow_cache_env == NULL || glm_graph_env_truthy(grow_cache_env))) {
-        uint64_t budget_bytes = 0;
-        uint64_t per_expert_bytes = 0;
-        if (ssd_streaming_cache_bytes <=
-            UINT64_MAX - ssd_streaming_prefill_headroom_bytes) {
-            budget_bytes =
-                ssd_streaming_cache_bytes + ssd_streaming_prefill_headroom_bytes;
-        }
-        const uint32_t grown_budget =
-            ds4_streaming_cache_experts_for_byte_budget(weights,
-                                                        budget_bytes,
-                                                        &per_expert_bytes);
-        const uint32_t current_budget =
-            ds4_gpu_stream_expert_cache_configured_count();
-        if (grown_budget > current_budget) {
-            ds4_gpu_set_streaming_expert_cache_budget(grown_budget);
-            fprintf(stderr,
-                    "ds4: ROCm GLM streaming expert cache grew after prefill: "
-                    "%u -> %u experts (%.2f GiB)\n",
-                    current_budget,
-                    grown_budget,
-                    (double)((uint64_t)grown_budget * per_expert_bytes) /
-                        1073741824.0);
-        }
-    }
-#else
-    (void)ssd_streaming_cache_bytes;
-    (void)ssd_streaming_prefill_headroom_bytes;
-#endif
+    ds4_glm_grow_streaming_cache_after_prefill(
+        weights,
+        ssd_streaming,
+        ssd_streaming_cache_bytes,
+        ssd_streaming_prefill_headroom_bytes);
 
     int n_generated = 0;
     int n_decode_eval = 0;
@@ -72537,6 +72569,14 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
         ds4_session_sync_lockstep(s, prompt, err, errlen) :
         ds4_session_sync_internal(s, prompt, err, errlen);
 #ifndef DS4_NO_GPU
+    if (rc == 0 && s && s->engine &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        ds4_glm_grow_streaming_cache_after_prefill(
+            &s->engine->weights,
+            s->engine->ssd_streaming,
+            s->engine->ssd_streaming_cache_bytes,
+            s->engine->ssd_streaming_prefill_headroom_bytes);
+    }
     if (rc == 0) glm_debug_dump_prefill_logits(s->logits);
     if (rc == 0) {
         const char *kvp = getenv("DS4_GLM_KV_DUMP");
