@@ -1154,7 +1154,7 @@ static int check_sweep_partitions(const char *path, const char *prompt_path) {
     int rc = 1;
     ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
         .context_size = 53248, .power_percent = 100, .ssd_streaming = true,
-        .ssd_streaming_cache_bytes = UINT64_C(56) << 30};
+        .ssd_streaming_cache_bytes = UINT64_C(24) << 30};
     REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &bytes));
     REQUIRE(ds4_engine_open(&engine, &opt) == 0);
     ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
@@ -1165,7 +1165,7 @@ static int check_sweep_partitions(const char *path, const char *prompt_path) {
     REQUIRE(a->carry_cap >= 24576 && b->carry_cap >= 24576);
     a->carry_cap = 8192;
     const uint32_t frontiers[] = {24576, 49152};
-    for (uint32_t i = 0; i < 2; i++) {
+    for (uint32_t i = 0; i < sizeof(frontiers) / sizeof(*frontiers); i++) {
         tokens.len = (int)frontiers[i];
         REQUIRE(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
         REQUIRE(ds4_session_sync(candidate, &tokens, err, sizeof(err)) == 0);
@@ -1191,6 +1191,60 @@ static int check_sweep_partitions(const char *path, const char *prompt_path) {
     puts("V4.1 sweep partitions: initial/continued prefill and following decode exact PASS");
     rc = 0;
 done:
+    if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+    ds4_tokens_free(&tokens);
+    free(prompt);
+    ds4_session_free(candidate); ds4_session_free(control); ds4_engine_close(engine);
+    return rc;
+}
+
+static int check_tail_rebalance(const char *path, const char *prompt_path) {
+    ds4_engine *engine = NULL;
+    ds4_session *control = NULL, *candidate = NULL;
+    ds4_tokens tokens = {0};
+    char *prompt = NULL, err[256] = {0};
+    size_t bytes;
+    int rc = 1;
+    ds4_engine_options opt = {.model_path = path, .backend = DS4_BACKEND_METAL,
+        .context_size = 36880, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(28) << 30};
+    REQUIRE(imatrix_read_text_file(prompt_path, &prompt, &bytes));
+    REQUIRE(ds4_engine_open(&engine, &opt) == 0);
+    ds4_encode_chat_prompt(engine, NULL, prompt, DS4_THINK_NONE, &tokens);
+    REQUIRE(tokens.len >= 36864);
+    tokens.len = 36864;
+    REQUIRE(ds4_session_create(&control, engine, opt.context_size) == 0);
+    REQUIRE(ds4_session_create(&candidate, engine, opt.context_size) == 0);
+    REQUIRE(setenv("DS4_METAL_DISABLE_V41_DEFER_TAIL_REBALANCE", "1", 1) == 0);
+    REQUIRE(ds4_session_sync(control, &tokens, err, sizeof(err)) == 0);
+    REQUIRE(unsetenv("DS4_METAL_DISABLE_V41_DEFER_TAIL_REBALANCE") == 0);
+    REQUIRE(ds4_session_sync(candidate, &tokens, err, sizeof(err)) == 0);
+    ds41_gpu_graph *a = &control->ds41_graph, *b = &candidate->ds41_graph;
+    ds41_state_span sa[64], sb[64];
+    const uint32_t n = ds41_state_spans(a, a->pos, sa);
+    REQUIRE(a->pos == b->pos && a->pos == 36864u);
+    REQUIRE(!memcmp(&a->history, &b->history, sizeof(a->history)));
+    REQUIRE(n == ds41_state_spans(b, b->pos, sb));
+    for (uint32_t j = 0; j < n; j++) {
+        REQUIRE(sa[j].bytes == sb[j].bytes);
+        if (memcmp(ds4_gpu_tensor_contents(sa[j].tensor),
+                   ds4_gpu_tensor_contents(sb[j].tensor), (size_t)sa[j].bytes)) {
+            fprintf(stderr, "tail rebalance state mismatch span=%u bytes=%llu\n",
+                    j, (unsigned long long)sa[j].bytes);
+            goto done;
+        }
+    }
+    REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+    for (uint32_t i = 0; i < 8; i++) {
+        const int token = sample_argmax(control->logits, DS4_N_VOCAB);
+        REQUIRE(ds4_session_eval(control, token, err, sizeof(err)) == 0);
+        REQUIRE(ds4_session_eval(candidate, token, err, sizeof(err)) == 0);
+        REQUIRE(!memcmp(control->logits, candidate->logits, DS4_N_VOCAB * sizeof(float)));
+    }
+    puts("V4.1 deferred tail rebalance: exact state/logits and following decode PASS");
+    rc = 0;
+done:
+    unsetenv("DS4_METAL_DISABLE_V41_DEFER_TAIL_REBALANCE");
     if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
     ds4_tokens_free(&tokens);
     free(prompt);
@@ -1946,6 +2000,8 @@ int main(int argc, char **argv) {
         return check_decoder_suffix(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--sweep-partitions"))
         return check_sweep_partitions(argv[1], argv[3]);
+    if (argc == 4 && !strcmp(argv[2], "--tail-rebalance"))
+        return check_tail_rebalance(argv[1], argv[3]);
     if (argc == 4 && !strcmp(argv[2], "--deferred-decoder"))
         return check_deferred_decoder(argv[1], argv[3]);
     if (argc == 6 && !strcmp(argv[1], "--chat-fixture"))
