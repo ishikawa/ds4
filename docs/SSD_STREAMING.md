@@ -53,6 +53,10 @@ A byte budget is a target, not a guaranteed allocation. DwarfStar reserves
 routed-prefill headroom and fits the cache to the remaining model, graph,
 context, and backend budget. The effective value may be smaller than requested.
 Non-routed weights and KV state are additional to that expert-cache budget.
+After a DeepSeek V4.1 prefill completes, Metal reassigns its routed-prefill
+headroom to the selected-expert cache without discarding resident entries.
+Set `DS4_METAL_GLM_STREAMING_GROW_CACHE_AFTER_PREFILL=0` only for controlled
+comparisons that need the startup cache capacity throughout decode.
 
 A plain number, such as `--ssd-streaming-cache-experts 4000`, requests dynamic
 expert slots rather than a byte budget. It is also subject to memory limits.
