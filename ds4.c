@@ -42194,6 +42194,19 @@ static bool ds41_tp_batch_enabled(const ds41_gpu_graph *g) {
         !getenv("DS4_METAL_DISABLE_V41_BATCH_HC"));
 }
 
+static uint32_t ds41_wide_prefill_min_tokens(void) {
+    /* Match the warm streaming batch crossover below. The carry workspace is
+     * already allocated, so one 2K-4K sweep avoids a second SSD layer pass
+     * without increasing the session memory plan. */
+    const char *env = getenv("DS4_METAL_V41_WIDE_PREFILL_MIN");
+    if (!env || !env[0]) return 1024u;
+    char *endp = NULL;
+    const unsigned long value = strtoul(env, &endp, 10);
+    if (endp == env || *endp != '\0' || value < 256u || value > UINT32_MAX)
+        return 1024u;
+    return (uint32_t)value;
+}
+
 static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) {
     /* TP batches use the bulk protocol; row-gate ablations stay token-major. */
     if (!ds41_tp_batch_enabled(g) || g->imatrix ||
@@ -42211,8 +42224,17 @@ static uint32_t ds41_prefill_count(const ds41_gpu_graph *g, uint32_t remaining) 
         minimum = 1024u;
 #endif
     if (remaining < minimum) return 1;
-    if (g->carry_cap && remaining >= 4096u &&
+    if (g->carry_cap && remaining >= ds41_wide_prefill_min_tokens() &&
         !getenv("DS4_METAL_DISABLE_V41_WIDE_PREFILL")) {
+        /* Leave a full final sweep when crossing the carry boundary.  The
+         * encoder can then be deferred across both sweeps instead of running
+         * the decoder once for the carry-sized prefix and again for a short
+         * tail. */
+        if (!getenv("DS4_METAL_DISABLE_V41_DEFER_TAIL_REBALANCE") &&
+            remaining > g->carry_cap && remaining - g->carry_cap < 8192u) {
+            const uint32_t prefix = remaining - 8192u;
+            if (prefix >= 16384u) return prefix;
+        }
         /* The carry allocation, unlike an encoder tile, can hold the final
          * partial tile. Preserve alignment only at an actual carry boundary. */
         return remaining <= g->carry_cap ? remaining :
@@ -42600,12 +42622,13 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
+            const bool full_frontier_suffix = short_decoder_suffix || resume_encoder;
             const ds41_decoder_suffix_plan plan =
-                short_decoder_suffix ?
+                full_frontier_suffix ?
                 ds41_short_decoder_suffix_make_plan(total_count, il) :
                 ds41_decoder_suffix_make_plan(total_count, il);
             ds41_decoder_suffix_plan execution = plan;
-            if (short_decoder_suffix && wide)
+            if (full_frontier_suffix && wide)
                 execution = ds41_decoder_suffix_align_plan(execution, encoder_chunk);
             first = execution.first;
             if (ok && execution.warm_count)
