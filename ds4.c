@@ -44714,6 +44714,8 @@ static void chat_push_bos_sequence(const ds4_vocab *vocab, token_vec *out) {
 
 const char *ds4_glm_reasoning_effort_text(ds4_think_mode mode) {
     switch (mode) {
+    case DS4_THINK_LOW:
+    case DS4_THINK_MEDIUM:
     case DS4_THINK_HIGH: return "Reasoning Effort: High";
     case DS4_THINK_MAX:  return "Reasoning Effort: Max";
     case DS4_THINK_NONE: return NULL;
@@ -59302,7 +59304,9 @@ static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 }
 
 bool ds4_think_mode_enabled(ds4_think_mode mode) {
-    return mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX || ds4_think_mode_level(mode) > 0;
+    return mode == DS4_THINK_LOW || mode == DS4_THINK_MEDIUM ||
+           mode == DS4_THINK_HIGH || mode == DS4_THINK_MAX ||
+           ds4_think_mode_level(mode) > 0;
 }
 
 int ds4_think_mode_level(ds4_think_mode mode) {
@@ -59332,6 +59336,8 @@ const char *ds4_think_mode_name(ds4_think_mode mode) {
     }
     switch (mode) {
     case DS4_THINK_NONE: return "none";
+    case DS4_THINK_LOW: return "low";
+    case DS4_THINK_MEDIUM: return "medium";
     case DS4_THINK_HIGH: return "high";
     case DS4_THINK_MAX:  return "max";
     }
@@ -68288,6 +68294,14 @@ size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size) {
     return bytes;
 }
 
+int ds4_test_qwen4_placement(uint64_t budget, int sessions,
+                              size_t *weights, size_t *runtime) {
+    const uint64_t gib = UINT64_C(1073741824);
+    *weights = 42u * gib + gib / 2u;
+    *runtime = (size_t)(sessions > 0 ? sessions : 1) * gib;
+    return budget >= *weights + *runtime;
+}
+
 int ds4_test_session_read_logits(ds4_session *s, float *out,
                                  uint64_t out_bytes) {
     if (!s || !out ||
@@ -70415,29 +70429,59 @@ bool ds4_engine_is_deepseek41(ds4_engine *e) {
     return DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41;
 }
 
+bool ds4_engine_is_qwen4(ds4_engine *e) {
+    (void)e;
+    return false;
+}
+
+const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode) {
+    static const char xhigh[] =
+        "Reasoning effort is set to xhigh. Please think carefully through the task, "
+        "validate key assumptions, consider plausible alternatives, and prioritize "
+        "correctness, consistency, and clarity in the final answer.";
+    static const char low[] =
+        "Reasoning effort is set to low. Keep your thinking brief and focused, "
+        "moving directly to the conclusion without unnecessary elaboration.";
+    switch (mode) {
+    case DS4_THINK_HIGH:
+    case DS4_THINK_MAX: return xhigh;
+    case DS4_THINK_LOW: return low;
+    case DS4_THINK_MEDIUM:
+    case DS4_THINK_NONE: return NULL;
+    }
+    return NULL;
+}
+
+void ds4_engine_tp_unbind(ds4_engine *e) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!e || !e->tp.ctx) return;
+    ds4_gpu_tp_shutdown();
+    ds4_tp_detach_slab(e->tp.ctx);
+    g_tp_block_ctx = NULL;
+    const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
+    for (uint32_t i = 0; i < slots; i++) {
+        if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
+        if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
+    }
+    for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
+        if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
+        if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
+    }
+    free(e->tp.batch_out_views);
+    free(e->tp.batch_in_views);
+    free(e->tp.out_views);
+    free(e->tp.in_views);
+    ds4_gpu_tensor_free(e->tp.zero_vec);
+    ds4_gpu_tensor_free(e->tp.slab);
+    memset(&e->tp, 0, sizeof(e->tp));
+#else
+    (void)e;
+#endif
+}
+
 void ds4_engine_close(ds4_engine *e) {
     if (!e) return;
-#if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (e->tp.active) {
-        ds4_gpu_tp_shutdown();
-        const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
-        for (uint32_t i = 0; i < slots; i++) {
-            if (e->tp.out_views) ds4_gpu_tensor_free(e->tp.out_views[i]);
-            if (e->tp.in_views) ds4_gpu_tensor_free(e->tp.in_views[i]);
-        }
-        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER; i++) {
-            if (e->tp.batch_out_views) ds4_gpu_tensor_free(e->tp.batch_out_views[i]);
-            if (e->tp.batch_in_views) ds4_gpu_tensor_free(e->tp.batch_in_views[i]);
-        }
-        free(e->tp.batch_out_views);
-        free(e->tp.batch_in_views);
-        free(e->tp.out_views);
-        free(e->tp.in_views);
-        ds4_gpu_tensor_free(e->tp.zero_vec);
-        ds4_gpu_tensor_free(e->tp.slab);
-        memset(&e->tp, 0, sizeof(e->tp));
-    }
-#endif
+    ds4_engine_tp_unbind(e);
     ds4_expert_profile_close();
     weights_free(&e->weights);
     vocab_free(&e->vocab);
@@ -76448,6 +76492,32 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
         const ds4_tokens *prefill_prompt,
         char *err,
         size_t errlen);
+
+int ds4_sessions_eval_batch_speculative_argmax(ds4_decode_item *items, int count,
+                                               int (*accepted)[2], int *n_accepted,
+                                               char *err, size_t errlen) {
+    if (!items || count <= 0 || !accepted || !n_accepted) {
+        if (err && errlen) snprintf(err, errlen, "empty speculative decode batch");
+        return 1;
+    }
+    for (int i = 0; i < count; i++) {
+        int toks[2];
+        const int room = (int)(items[i].session->ctx_size -
+                               items[i].session->checkpoint.len);
+        const int n = ds4_session_eval_speculative_argmax(
+                items[i].session, items[i].token, room < 2 ? room : 2, -1,
+                toks, 2, err, errlen);
+        if (n <= 0) {
+            for (int j = 0; j < count; j++)
+                ds4_session_invalidate(items[j].session);
+            return 1;
+        }
+        n_accepted[i] = n;
+        accepted[i][0] = toks[0];
+        accepted[i][1] = n > 1 ? toks[1] : -1;
+    }
+    return 0;
+}
 
 int ds4_sessions_eval_batch(ds4_decode_item *items, int count,
                             char *err, size_t errlen) {
