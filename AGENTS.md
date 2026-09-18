@@ -48,6 +48,12 @@ Use `make` for build validation. Use `make test` for unit/regression tests when 
 model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
 
+After every large change to inference, tokenization, prompting, caching, model
+loading, scheduling, or GPU kernels, run the lightweight quality/performance A/B
+in `docs/SMOKE_QUALITY_PERFORMANCE.md`. Preserve the JSON report with the change
+or its review evidence. Exact quality mismatch or a performance regression over
+the agreed threshold blocks merging until it is explained and accepted.
+
 At every major change where one of the following could be affected, make sure to:
 
 1. Test the normal Metal path and that speed is still at the level it was.
