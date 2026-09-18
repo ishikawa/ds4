@@ -68,6 +68,10 @@ in this system.
 
 - Run the default suite:
   `make test`.
+- After a large inference, tokenizer, prompt, cache, scheduler, model-loading,
+  or GPU-kernel change, run the lightweight A/B described in
+  `docs/SMOKE_QUALITY_PERFORMANCE.md`. Require exact output agreement and no
+  unexplained throughput regression before proceeding to the longer gates.
 - Run `tests/test_gpu_args_cli.sh` explicitly after changing executable option
   parsing or multi-GPU placement. Invalid values and device/budget count
   mismatches must reach the shared GPU parser in all four binaries; an
