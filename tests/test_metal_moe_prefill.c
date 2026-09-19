@@ -403,8 +403,10 @@ int main(int argc, char **argv) {
          * copying its experts back into a decode cache. */
         ds4_gpu_set_ssd_streaming(true);
         ds4_gpu_set_streaming_expert_cache_budget(EXPERTS);
+        setenv("DS4_METAL_ENABLE_V41_IQ2_COMPACT_TILE", "1", 1);
         for (unsigned i = 0; i < sizeof(sizes) / sizeof(*sizes) && ok; i++)
             ok = check_case(model, model_size, up_off, down_off, sizes[i], false, -1);
+        unsetenv("DS4_METAL_ENABLE_V41_IQ2_COMPACT_TILE");
     }
     ds4_gpu_cleanup();
     free(model);
