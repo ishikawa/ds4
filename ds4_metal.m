@@ -45804,6 +45804,21 @@ int ds4_gpu_routed_moe_batch_tensor(
             g_tp_split_world == 1 &&
             (use_pre_m5_mxfp4_mm_id_pair_tail_simdgroup_cull_default ||
              (g_test_flags & DS4_GPU_TEST_MXFP4_PAIR_TAIL_CULL) != 0u);
+        // The 32-row tile wins at 765/913 tokens, but the gain is marginal at
+        // 1024; keep the default below that boundary while allowing opt-in tests.
+        const bool use_v41_iq2_compact_tile_default =
+            ds4_gpu_device_is_pre_m5_apple_silicon() && g_ssd_streaming_mode &&
+            n_tokens >= 512u && n_tokens < 1024u &&
+            getenv("DS4_METAL_DISABLE_V41_IQ2_COMPACT_TILE") == NULL;
+        const bool use_v41_iq2_compact_tile =
+            use_mm_id_pair_swiglu && g_tp_split_world == 1 &&
+            n_tokens >= 512u && n_tokens < 2048u && n_total_expert == 384u &&
+            n_expert == 6u && expert_in_dim == 5120u && expert_mid_dim == 2304u &&
+            gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
+            down_type == DS4_METAL_TENSOR_Q2_K && request_mid_f16 &&
+            ds4_gpu_routed_mm_mpp_mask() == 0 &&
+            (use_v41_iq2_compact_tile_default ||
+             getenv("DS4_METAL_ENABLE_V41_IQ2_COMPACT_TILE") != NULL);
         const bool use_pre_m5_mxfp4_mm_id_down_tail_simdgroup_cull_default =
             ds4_gpu_device_is_pre_m5_apple_silicon() &&
             !g_ssd_streaming_mode &&
@@ -45980,7 +45995,9 @@ int ds4_gpu_routed_moe_batch_tensor(
                                 (use_mxfp4_mm_id_pair_half_scale ?
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16_half_scale" :
                                     "kernel_mul_mm_id_mxfp4_pair_swiglu_f16")) :
-                            "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
+                            use_v41_iq2_compact_tile ?
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16_compact_tail_cull" :
+                                "kernel_mul_mm_id_iq2_xxs_pair_swiglu_f16");
             }
             if (!map_pipeline || !gate_mm_pipeline || !up_mm_pipeline || !down_mm_pipeline ||
                 (use_mm_id_pair_swiglu && !pair_swiglu_mm_pipeline)) {
@@ -46366,7 +46383,8 @@ int ds4_gpu_routed_moe_batch_tensor(
                 };
                 ok = ds4_gpu_encode_mul_mm_id_iq2_pair_swiglu_f16(cb,
                                                                    pair_swiglu_mm_pipeline,
-                                                                   use_mxfp4_mm_id_pair_swiglu_compact_tile,
+                                                                   use_mxfp4_mm_id_pair_swiglu_compact_tile ||
+                                                                       use_v41_iq2_compact_tile,
                                                                    &gate_mm_args,
                                                                    &act_args,
                                                                    gate_buf,
