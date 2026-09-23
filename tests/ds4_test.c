@@ -6870,7 +6870,7 @@ static void test_tool_call_quality_one(bool quality) {
 
     bool request_ok = parse_chat_request(engine, &s,
                                          test_tool_call_request_json(),
-                                         512, 32768, &first_request,
+                                         512, 32768, false, &first_request,
                                          err, sizeof(err));
     TEST_ASSERT(request_ok);
     if (!request_ok) goto done;
@@ -6908,7 +6908,7 @@ static void test_tool_call_quality_one(bool quality) {
 
     err[0] = '\0';
     request_ok = parse_chat_request(engine, &s, second_body,
-                                    512, 32768, &second_request,
+                                    512, 32768, false, &second_request,
                                     err, sizeof(err));
     TEST_ASSERT(request_ok);
     if (!request_ok) goto done;

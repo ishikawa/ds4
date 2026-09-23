@@ -824,6 +824,11 @@ typedef struct {
     bool stream;
     bool stream_include_usage;
     bool ignore_eos;
+    bool candidate_only;
+    bool candidate_labels_present;
+    char *candidate_labels[255];
+    int candidate_token_ids[255];
+    int candidate_count;
     int cache_read_tokens;
     int cache_write_tokens;
     ds4_think_mode think_mode;
@@ -1019,6 +1024,7 @@ static void request_free(request *r) {
     free(r->stops.v);
     free(r->raw_body);
     free(r->prompt_text);
+    for (int i = 0; i < r->candidate_count; i++) free(r->candidate_labels[i]);
     stop_list_clear(&r->responses_live_call_ids);
     free(r->responses_live_call_ids.v);
     free(r->responses_live_suffix_text);
@@ -4094,15 +4100,58 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_candidate_labels(const char **p, request *r) {
+    json_ws(p);
+    if (**p != '[') return false;
+    (*p)++;
+    json_ws(p);
+    while (**p && **p != ']') {
+        if (r->candidate_count == 255) return false;
+        char *label = NULL;
+        if (!json_string(p, &label)) return false;
+        r->candidate_labels[r->candidate_count++] = label;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+            if (**p == ']') return false;
+        } else if (**p != ']') {
+            return false;
+        }
+    }
+    if (**p != ']') return false;
+    (*p)++;
+    return true;
+}
+
+/* The chat renderer owns the answer prefix. Tokenize that exact prefix plus
+ * each label so a boundary merge cannot be mistaken for a one-token answer. */
+static void resolve_candidate_tokens(ds4_engine *e, request *r) {
+    for (int i = 0; i < r->candidate_count; i++) {
+        buf text = {0};
+        ds4_tokens continuation = {0};
+        buf_puts(&text, r->prompt_text);
+        buf_puts(&text, r->candidate_labels[i]);
+        ds4_tokenize_rendered_chat(e, text.ptr, &continuation);
+        r->candidate_token_ids[i] =
+            continuation.len == r->prompt.len + 1 &&
+            ds4_tokens_starts_with(&continuation, &r->prompt)
+                ? continuation.v[continuation.len - 1] : -1;
+        ds4_tokens_free(&continuation);
+        buf_free(&text);
+    }
+}
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
-                               int ctx_size, request *r, char *err, size_t errlen) {
+                               int ctx_size, bool candidate_only, request *r,
+                               char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     bool got_messages = false;
     bool tool_choice_none = false;
     bool got_thinking = false;
-    bool thinking_enabled = true;
+    bool thinking_enabled = !candidate_only;
     ds4_think_mode reasoning_effort = DS4_THINK_HIGH;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
@@ -4201,6 +4250,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
                 free(key);
                 goto bad;
             }
+        } else if (!strcmp(key, "candidate_labels")) {
+            if (r->candidate_labels_present || !parse_candidate_labels(&p, r)) {
+                free(key);
+                goto bad;
+            }
+            r->candidate_labels_present = true;
         } else if (!strcmp(key, "stream_options")) {
             if (!parse_stream_options(&p, &r->stream_include_usage)) {
                 free(key);
@@ -9029,6 +9084,67 @@ static bool final_response(int fd, bool enable_cors,
     return ok;
 }
 
+static bool candidate_logprobs_json(buf *b, const request *r,
+                                    const float *logits, int vocab,
+                                    int prompt_tokens) {
+    double max_logit = -DBL_MAX;
+    for (int i = 0; i < vocab; i++) {
+        if (isfinite(logits[i]) && logits[i] > max_logit) max_logit = logits[i];
+    }
+    if (max_logit == -DBL_MAX) {
+        return false;
+    }
+    double sum = 0.0;
+    for (int i = 0; i < vocab; i++) {
+        if (isfinite(logits[i])) sum += exp((double)logits[i] - max_logit);
+    }
+    const double logsum = max_logit + log(sum);
+    buf_puts(b, "{\"schema_version\":1,\"position\":\"next_token\",\"normalization\":\"full_vocabulary\",\"model\":");
+    json_escape(b, r->model);
+    buf_printf(b, ",\"prompt_tokens\":%d,\"thinking_enabled\":%s,\"candidates\":[",
+               prompt_tokens, ds4_think_mode_enabled(r->think_mode) ? "true" : "false");
+    for (int i = 0; i < r->candidate_count; i++) {
+        if (i) buf_putc(b, ',');
+        buf_puts(b, "{\"label\":");
+        json_escape(b, r->candidate_labels[i]);
+        const int token = r->candidate_token_ids[i];
+        if (token < 0 || token >= vocab) {
+            buf_puts(b, ",\"single_token\":false,\"token_id\":null,\"logit\":null,\"logprob\":null}");
+        } else if (!isfinite(logits[token])) {
+            buf_printf(b, ",\"single_token\":true,\"token_id\":%d,\"logit\":null,\"logprob\":null}", token);
+        } else {
+            buf_printf(b, ",\"single_token\":true,\"token_id\":%d,\"logit\":%.9g,\"logprob\":%.9g}",
+                       token, logits[token], (double)logits[token] - logsum);
+        }
+    }
+    buf_puts(b, "]}\n");
+    return true;
+}
+
+/* Read the unsampled next-token logits once. Top-N output can omit a
+ * candidate even at N=1024, so this endpoint returns every requested row. */
+static bool candidate_logprobs_response(ds4_engine *engine,
+                                        ds4_session *session, bool enable_cors,
+                                        const request *r, int fd, int prompt_tokens) {
+    const int vocab = ds4_engine_vocab_size(engine);
+    float *logits = xmalloc((size_t)vocab * sizeof(logits[0]));
+    if (ds4_session_copy_logits(session, logits, vocab) != vocab) {
+        free(logits);
+        http_error(fd, enable_cors, 500, "next-token logits unavailable");
+        return false;
+    }
+    buf b = {0};
+    if (!candidate_logprobs_json(&b, r, logits, vocab, prompt_tokens)) {
+        free(logits);
+        http_error(fd, enable_cors, 500, "next-token logits are nonfinite");
+        return false;
+    }
+    bool ok = http_response(fd, enable_cors, 200, "application/json", b.ptr);
+    buf_free(&b);
+    free(logits);
+    return ok;
+}
+
 static const char *anthropic_stop_reason(const char *finish) {
     if (finish && !strcmp(finish, "tool_calls")) return "tool_use";
     if (finish && !strcmp(finish, "length")) return "max_tokens";
@@ -13423,7 +13539,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             cache_source = cached > 0 ? "memory-token" : "none";
         }
     }
-    if (cached == 0) {
+    /* Candidate scores must describe the request's exact prompt tokens.
+     * Text/visible cache keys may carry sampled hidden reasoning or a
+     * different tokenization of the same bytes. */
+    if (cached == 0 && !j->req.candidate_only) {
         int thinking_cached =
             thinking_live_visible_prefix_prompt(s, slot, &j->req, old_pos,
                                                 &effective_prompt);
@@ -13437,7 +13556,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     int disk_cached = 0;
     char *disk_cache_path = NULL;
     uint8_t disk_cache_ext_flags = 0;
-    if (cached == 0) {
+    if (cached == 0 && !j->req.candidate_only) {
         int text_cached = live_text_prefix_prompt(s, slot, &j->req,
                                                   &effective_prompt);
         if (text_cached > 0) {
@@ -13467,7 +13586,7 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
          * would silently discard the newer conversation state. */
         kv_cache_store_current(s, slot, "evict");
     }
-    if (!multimodal && cached == 0) {
+    if (!multimodal && cached == 0 && !j->req.candidate_only) {
         disk_cached = kv_cache_try_load(s, slot, &j->req, &effective_prompt,
                                         &disk_cache_path,
                                         &disk_cache_ext_flags);
@@ -13677,6 +13796,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             kv_cache_slot_restore_suppressed(slot, suppressed_continued_last,
                                              cold_store_len);
         }
+    }
+    if (j->req.candidate_only) {
+        bool response_ok = candidate_logprobs_response(
+            s->engine, slot->session, s->enable_cors,
+            &j->req, j->fd, prompt_tokens);
+        tool_calls no_calls = {0};
+        trace_finish(s, trace_id, &j->req,
+                     response_ok ? "candidate_logprobs" : "error", 0,
+                     false, false, "", NULL, &no_calls, now_sec() - t0);
+        if (!response_ok) job_mark_cancelled(j);
+        ds4_tokens_free(&effective_prompt);
+        return;
     }
     char id[96];
     responses_random_id(id, sizeof(id),
@@ -15154,13 +15285,18 @@ static void *client_main(void *arg) {
     request req;
     char err[160];
     bool ok = false;
+    const bool candidate_endpoint =
+        !strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/candidate_logprobs");
     const int ctx_size = s->ctx_size;
     if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/messages")) {
         ok = parse_anthropic_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/chat/completions")) {
         ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
-                                ctx_size, &req, err, sizeof(err));
+                                ctx_size, false, &req, err, sizeof(err));
+    } else if (candidate_endpoint) {
+        ok = parse_chat_request(s->engine, s, hr.body, s->default_tokens,
+                                ctx_size, true, &req, err, sizeof(err));
     } else if (!strcmp(hr.method, "POST") && !strcmp(hr.path, "/v1/responses")) {
         ok = parse_responses_request(s->engine, s, hr.body, s->default_tokens,
                                      ctx_size, &req, err, sizeof(err));
@@ -15178,6 +15314,21 @@ static void *client_main(void *arg) {
         http_error(fd, s->enable_cors, 400, err);
         goto done;
     }
+    if (candidate_endpoint) {
+        if (req.candidate_count == 0 || req.stream || req.image_count || req.has_tools ||
+            ds4_think_mode_enabled(req.think_mode)) {
+            http_error(fd, s->enable_cors, 400,
+                       "candidate_logprobs requires 1..255 labels, text-only messages, no tools, stream=false, and thinking disabled");
+            request_free(&req);
+            goto done;
+        }
+        req.candidate_only = true;
+    } else if (req.candidate_labels_present) {
+        http_error(fd, s->enable_cors, 400,
+                   "candidate_labels is only supported by /v1/candidate_logprobs");
+        request_free(&req);
+        goto done;
+    }
     if (!req.model_from_request) {
         free(req.model);
         req.model = xstrdup(server_model_id_from_engine(s->engine));
@@ -15187,6 +15338,7 @@ static void *client_main(void *arg) {
         request_free(&req);
         goto done;
     }
+    if (candidate_endpoint) resolve_candidate_tokens(s->engine, &req);
 
     set_client_socket_nonblocking(fd);
     job j;
@@ -17381,7 +17533,7 @@ static void test_chat_ignore_eos_contract(void) {
         NULL, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
         "\"ignore_eos\":true}",
-        128, 32768, &r, err, sizeof(err));
+        128, 32768, false, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(strstr(err, "temperature") != NULL);
 
@@ -17389,7 +17541,7 @@ static void test_chat_ignore_eos_contract(void) {
         NULL, NULL,
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
         "\"temperature\":0,\"ignore_eos\":\"yes\"}",
-        128, 32768, &r, err, sizeof(err));
+        128, 32768, false, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
 }
@@ -20038,7 +20190,7 @@ static void test_request_parsers_reject_malformed_duplicate_owned_fields(void) {
         "{\"model\":\"deepseek-v4-flash\",\"model\":\"bad\\q\","
         "\"max_tokens\":1,\"messages\":[{\"role\":\"user\","
         "\"content\":\"hello\"}]}",
-        1, 100, &r, err, sizeof(err));
+        1, 100, false, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     if (ok) request_free(&r);
 
@@ -22088,7 +22240,41 @@ static void test_deepseek41_live_result_order(void) {
     pthread_mutex_destroy(&s.tool_mu);
 }
 
+static void test_candidate_logprobs_contract(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 1);
+    r.think_mode = DS4_THINK_NONE;
+    const char *labels = "[\"A\",\"B\\\"\",\"two tokens\"]";
+    TEST_ASSERT(parse_candidate_labels(&labels, &r));
+    TEST_ASSERT(*labels == '\0');
+    TEST_ASSERT(r.candidate_count == 3);
+    r.candidate_token_ids[0] = 0;
+    r.candidate_token_ids[1] = 1;
+    r.candidate_token_ids[2] = -1;
+    const float logits[] = {0.0f, 0.0f};
+    buf b = {0};
+    TEST_ASSERT(candidate_logprobs_json(&b, &r, logits, 2, 7));
+    TEST_ASSERT(strstr(b.ptr, "\"prompt_tokens\":7,\"thinking_enabled\":false"));
+    TEST_ASSERT(strstr(b.ptr, "\"label\":\"B\\\"\""));
+    TEST_ASSERT(strstr(b.ptr, "\"logprob\":-0.693147181"));
+    TEST_ASSERT(strstr(b.ptr, "\"single_token\":false,\"token_id\":null"));
+    buf_free(&b);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 1);
+    labels = "[\"A\",42]";
+    TEST_ASSERT(!parse_candidate_labels(&labels, &r));
+    TEST_ASSERT(r.candidate_count == 1);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 1);
+    labels = "[\"A\",]";
+    TEST_ASSERT(!parse_candidate_labels(&labels, &r));
+    request_free(&r);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_candidate_logprobs_contract();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
