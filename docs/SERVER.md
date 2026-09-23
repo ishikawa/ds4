@@ -25,6 +25,7 @@ relative runtime files such as Metal kernels can be found.
 | --- | --- |
 | `GET /v1/models` | Loaded model information |
 | `POST /v1/chat/completions` | OpenAI-style chat |
+| `POST /v1/candidate_logprobs` | Next-token logits and logprobs for named answer candidates |
 | `POST /v1/responses` | Responses-style requests and continuations |
 | `POST /v1/completions` | Text completions |
 | `POST /v1/messages` | Anthropic-style messages |
@@ -48,6 +49,22 @@ For DeepSeek, thinking is on by default. `reasoning_effort=max` selects Think
 Max only with sufficient context; otherwise it falls back to normal thinking.
 `xhigh` maps to normal thinking, not Think Max. Use `think:false`, a disabled
 thinking object, or a non-thinking model alias for direct answers.
+
+To score answer choices without sampling, send chat `messages` and 1–255
+`candidate_labels` to `/v1/candidate_logprobs`:
+
+```sh
+curl http://127.0.0.1:8000/v1/candidate_logprobs \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Reply A or B."}],"candidate_labels":["A","B"]}'
+```
+
+This endpoint defaults to thinking off and rejects requests that enable it.
+It accepts text-only messages without tools or streaming. Each result reports
+whether appending its label to the rendered prompt produces exactly one new
+token. Multi-token labels return null scores. `logprob` uses the full model
+vocabulary as its denominator, so candidate probabilities need not sum to one;
+`logit` and `logprob` are the unsampled next-token values.
 
 ## Multiple sessions
 
