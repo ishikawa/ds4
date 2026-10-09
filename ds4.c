@@ -2246,6 +2246,12 @@ typedef struct {
     ds4_tensor *tensors;
 } ds4_model;
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Separate open-file state: mmap/decode must retain the original fd policy. */
+static int metal_graph_v41_copy_nocache_fd = -1;
+static const void *metal_graph_v41_copy_nocache_map;
+#endif
+
 static uint64_t scalar_value_size(uint32_t type) {
     switch (type) {
     case GGUF_VALUE_UINT8:
@@ -2469,6 +2475,13 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (m->map && metal_graph_v41_copy_nocache_map == m->map) {
+        close(metal_graph_v41_copy_nocache_fd);
+        metal_graph_v41_copy_nocache_fd = -1;
+        metal_graph_v41_copy_nocache_map = NULL;
+    }
+#endif
     if (m->map) munmap((void *)m->map, (size_t)m->size);
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -19136,6 +19149,8 @@ typedef struct {
     bool profile;
     bool madvise_only;
     bool pread_only;
+    bool pread_nocache;
+    int pread_fd;
     bool readahead_only;
     bool started;
     bool ok;
@@ -19882,15 +19897,55 @@ static bool metal_graph_stream_pagein_touch_range(
     return true;
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+static int metal_graph_v41_prefill_nocache_fd(const ds4_model *model) {
+    if (metal_graph_v41_copy_nocache_fd >= 0 &&
+        metal_graph_v41_copy_nocache_map == model->map)
+        return metal_graph_v41_copy_nocache_fd;
+    char path[PATH_MAX];
+    if (fcntl(model->fd, F_GETPATH, path) == -1) {
+        fprintf(stderr, "ds4: resident copy model path lookup failed: %s\n", strerror(errno));
+        return -1;
+    }
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        fprintf(stderr, "ds4: resident copy nocache open failed: %s\n", strerror(errno));
+        return -1;
+    }
+    /* Reopening a replaced pathname must not mix two models' weight bytes. */
+    struct stat original, reopened;
+    if (fstat(model->fd, &original) || fstat(fd, &reopened) ||
+        original.st_dev != reopened.st_dev || original.st_ino != reopened.st_ino ||
+        original.st_size != reopened.st_size) {
+        fprintf(stderr, "ds4: resident copy nocache fd does not match the mapped model\n");
+        close(fd);
+        return -1;
+    }
+    /* Explicit large reads need neither UBC population nor speculative reads. */
+    if (fcntl(fd, F_NOCACHE, 1) == -1 || fcntl(fd, F_RDAHEAD, 0) == -1) {
+        fprintf(stderr, "ds4: resident copy nocache fd setup failed: %s\n", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    if (metal_graph_v41_copy_nocache_fd >= 0) close(metal_graph_v41_copy_nocache_fd);
+    metal_graph_v41_copy_nocache_fd = fd;
+    metal_graph_v41_copy_nocache_map = model->map;
+    fprintf(stderr, "ds4: resident layer copy pread nocache=1 readahead=0 chunk=8 MiB\n");
+    return fd;
+}
+#endif
+
 static bool metal_graph_stream_pread_range(
         const ds4_model *model,
         uint64_t         offset,
         uint64_t         size,
         uint64_t        *read_bytes,
         uint8_t         *sink,
-        uint8_t         *destination) {
+        uint8_t         *destination,
+        int              fd,
+        bool             nocache) {
     if (!model ||
-        model->fd < 0 ||
+        fd < 0 ||
         offset > model->size ||
         size == 0 ||
         size > model->size - offset) {
@@ -19898,7 +19953,7 @@ static bool metal_graph_stream_pread_range(
     }
     if (offset > (uint64_t)LLONG_MAX) return false;
 
-    const size_t chunk = 1024u * 1024u;
+    const size_t chunk = (nocache ? 8u : 1u) * 1024u * 1024u;
     uint8_t *scratch = destination ? NULL : xmalloc(chunk);
     uint8_t *buf = destination ? destination : scratch;
     uint64_t pos = offset;
@@ -19906,10 +19961,16 @@ static bool metal_graph_stream_pread_range(
     uint8_t s = sink ? *sink : 0;
     bool ok = true;
     while (rem != 0) {
-        const size_t want = rem > (uint64_t)chunk ? chunk : (size_t)rem;
+        size_t want = rem > (uint64_t)chunk ? chunk : (size_t)rem;
+        /* Consume a partial head first; full calls then start on 4 KiB file
+         * and destination boundaries. A span tail can remain partial. */
+        if (nocache && (pos & 4095u)) {
+            const size_t head = 4096u - (size_t)(pos & 4095u);
+            if (want > head) want = head;
+        }
         ssize_t nread;
         do {
-            nread = pread(model->fd, buf, want, (off_t)pos);
+            nread = pread(fd, buf, want, (off_t)pos);
         } while (nread < 0 && errno == EINTR);
         if (nread <= 0) {
             ok = false;
@@ -19944,7 +20005,9 @@ static bool metal_graph_stream_prepare_range(
                                               size,
                                               touched,
                                               sink,
-                                              destination);
+                                              destination,
+                                              job->pread_fd,
+                                              job->pread_nocache);
     }
     if (job->readahead_only) {
         metal_graph_stream_readahead_range_impl(job->model,
@@ -20427,7 +20490,20 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     if (metal_graph_v41_resident_copy)
         destination = ds4_gpu_v41_prefill_layer_copy_contents(il % 2u);
 #endif
-    const uint64_t page = (uint64_t)getpagesize();
+    job->pread_fd = model->fd;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const char *nocache_env = getenv("DS4_METAL_V41_PREFILL_RESIDENT_LAYER_COPY_NOCACHE");
+    job->pread_nocache = destination && pread_only && nocache_env && !strcmp(nocache_env, "1");
+    if (job->pread_nocache) {
+        job->pread_fd = metal_graph_v41_prefill_nocache_fd(model);
+        if (job->pread_fd < 0) {
+            free(ranges);
+            free(spans.v);
+            return false;
+        }
+    }
+#endif
+    const uint64_t page = job->pread_nocache ? 4096u : (uint64_t)getpagesize();
     uint64_t packed_end = 0;
     for (uint32_t i = 0; i < spans.len; i++) {
         const uint64_t size = spans.v[i].end - spans.v[i].off;
@@ -20441,11 +20517,17 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
         uint64_t consumed = 0;
         uint64_t chunk = size / n_threads;
         if (chunk > page) chunk = (chunk / page) * page;
-        if (chunk == 0) chunk = size;
+        if (chunk == 0 || (job->pread_nocache && chunk < page)) chunk = size;
         for (uint32_t t = 0; t < n_threads && consumed < size; t++) {
             uint64_t this_size =
                 (t + 1u == n_threads || size - consumed <= chunk) ?
                 size - consumed : chunk;
+            if (job->pread_nocache && this_size < size - consumed) {
+                const uint64_t start = spans.v[i].off + consumed;
+                const uint64_t end = (start + this_size) & ~4095ull;
+                /* Split on absolute file pages, not relative span offsets. */
+                this_size = end > start ? end - start : size - consumed;
+            }
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 spans.v[i].off + consumed,
                 this_size,
