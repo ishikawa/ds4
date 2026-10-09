@@ -20428,8 +20428,16 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
         destination = ds4_gpu_v41_prefill_layer_copy_contents(il % 2u);
 #endif
     const uint64_t page = (uint64_t)getpagesize();
+    uint64_t packed_end = 0;
     for (uint32_t i = 0; i < spans.len; i++) {
         const uint64_t size = spans.v[i].end - spans.v[i].off;
+        uint64_t packed_offset = 0;
+        if (destination && !ds4_gpu_v41_prefill_layer_copy_span(
+                packed_end, spans.v[i].off, size, &packed_offset, &packed_end)) {
+            free(ranges);
+            free(spans.v);
+            return false;
+        }
         uint64_t consumed = 0;
         uint64_t chunk = size / n_threads;
         if (chunk > page) chunk = (chunk / page) * page;
@@ -20441,7 +20449,7 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 spans.v[i].off + consumed,
                 this_size,
-                destination ? destination + job->bytes + consumed : NULL,
+                destination ? destination + packed_offset + consumed : NULL,
             };
             consumed += this_size;
         }
@@ -43406,8 +43414,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             uint64_t bytes = 0;
             for (uint32_t i = 0; i < spans.len; i++) {
                 const uint64_t size = spans.v[i].end - spans.v[i].off;
-                if (size > UINT64_MAX - bytes) { ok = false; break; }
-                bytes += size;
+                uint64_t packed_offset;
+                if (!ds4_gpu_v41_prefill_layer_copy_span(bytes, spans.v[i].off,
+                        size, &packed_offset, &bytes)) { ok = false; break; }
             }
             if (bytes > max_bytes) max_bytes = bytes;
             free(spans.v);

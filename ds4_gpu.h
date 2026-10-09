@@ -266,6 +266,23 @@ int ds4_gpu_side_dense_q8_ok(void);
 
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
+/* Preserve each GGUF span's page-relative alignment in a copied layer.
+ * Use this rule for allocation sizing, CPU reads, and Metal view offsets. */
+static inline bool ds4_gpu_v41_prefill_layer_copy_span(
+        uint64_t previous_end, uint64_t file_offset, uint64_t size,
+        uint64_t *packed_offset, uint64_t *packed_end) {
+    const uint64_t mask = 4095u;
+    if (previous_end > UINT64_MAX - mask) return false;
+    const uint64_t page = (previous_end + mask) & ~mask;
+    const uint64_t leading = file_offset & mask;
+    if (page > UINT64_MAX - leading) return false;
+    const uint64_t offset = page + leading;
+    if (size > UINT64_MAX - offset) return false;
+    *packed_offset = offset;
+    *packed_end = offset + size;
+    return true;
+}
+
 #if defined(__APPLE__)
 /* V4.1 streaming prefill only; packed spans retain their GGUF offset identity. */
 int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes);

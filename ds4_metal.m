@@ -13645,6 +13645,12 @@ int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes) {
             buffers[i] = [g_device newBufferWithLength:(NSUInteger)bytes
                                              options:MTLResourceStorageModeShared];
             if (!buffers[i]) return 0;
+            /* Offsets preserve 4 KiB alignment only with a page-aligned base. */
+            const uintptr_t base = (uintptr_t)[buffers[i] contents];
+            if (!base || base % (uintptr_t)getpagesize() || (base & 4095u)) {
+                fprintf(stderr, "ds4: V4.1 resident layer copy base is not page aligned\n");
+                return 0;
+            }
             buffers[i].label = @"ds4_v41_prefill_layer_copy";
         }
         /* Touch every page on the GPU once, including when model residency is
@@ -13688,18 +13694,21 @@ int ds4_gpu_v41_prefill_layer_copy_bind(const void *map, uint64_t model_size,
         return 0;
     uint64_t packed = 0;
     for (uint32_t i = 0; i < count; i++) {
+        uint64_t packed_offset;
         if (offsets[i] > model_size || !sizes[i] || sizes[i] > model_size - offsets[i] ||
-            sizes[i] > g_v41_prefill_layer_copy_bytes - packed) return 0;
-        packed += sizes[i];
+            !ds4_gpu_v41_prefill_layer_copy_span(packed, offsets[i], sizes[i],
+                &packed_offset, &packed) || packed > g_v41_prefill_layer_copy_bytes) return 0;
     }
     ds4_gpu_model_views_remove_map(map);
     if (count > DS4_METAL_MAX_MODEL_VIEWS - g_model_view_count) return 0;
     packed = 0;
     for (uint32_t i = 0; i < count; i++) {
+        uint64_t packed_offset;
+        if (!ds4_gpu_v41_prefill_layer_copy_span(packed, offsets[i], sizes[i],
+                &packed_offset, &packed)) return 0;
         g_model_views[g_model_view_count++] = (ds4_gpu_model_view){
-            g_v41_prefill_layer_copy[slot], map, model_size, offsets[i], sizes[i], packed
+            g_v41_prefill_layer_copy[slot], map, model_size, offsets[i], sizes[i], packed_offset
         };
-        packed += sizes[i];
     }
     g_v41_prefill_layer_copy_map = map;
     g_model_map_ptr = map;
