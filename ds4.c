@@ -21025,6 +21025,11 @@ static bool metal_graph_v41_prefill_resident_copy_enabled(void) {
     return env && !strcmp(env, "1");
 }
 
+static bool metal_graph_v41_copy_cache_window_enabled(void) {
+    const char *env = getenv("DS4_METAL_V41_PREFILL_COPY_CACHE_WINDOW");
+    return metal_graph_v41_prefill_resident_copy_enabled() && env && strcmp(env, "1") == 0;
+}
+
 static bool metal_graph_v41_prefill_layer_copy_max_bytes(
         const ds4_weights *weights, uint64_t *max_bytes) {
     *max_bytes = 0;
@@ -43528,6 +43533,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         /* Also protects the first prepare from a preceding request's work. */
         if (ok) ok = ds4_gpu_synchronize() &&
                      ds4_gpu_v41_prefill_layer_copy_allocate(max_bytes);
+        if (ok && metal_graph_v41_copy_cache_window_enabled())
+            ok = ds4_gpu_v41_window_reserve() != 0;
     }
 #endif
     metal_graph_stream_prepare_slot prepare = {0};
@@ -43814,6 +43821,9 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     metal_graph_v41_resident_copy = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (metal_graph_v41_copy_cache_window_enabled() && !ds4_gpu_v41_window_return()) ok = false;
+#endif
     if (ok && !encoder_only) {
         ok = ds4_gpu_begin_commands() &&
              ds4_gpu_tensor_copy(g->residual, 0, row.residual, 0, (uint64_t)DS4_N_HC * DS4_N_EMBD * 4u) &&
@@ -44717,6 +44727,8 @@ struct ds4_engine {
     uint64_t ssd_streaming_cache_bytes;
     uint64_t ssd_streaming_prefill_headroom_bytes;
     uint64_t v41_prefill_layer_copy_bytes;
+    uint64_t v41_copy_window_stride;
+    uint32_t v41_copy_window_slots;
     uint64_t ssd_streaming_full_layer_bytes;
     uint64_t ssd_streaming_decode_map_bytes;
     uint64_t ssd_streaming_decode_map_extra_bytes;
@@ -44813,7 +44825,7 @@ static uint64_t ds4_engine_streaming_transient_guard_bytes(
     if (!e || !e->ssd_streaming) return 0;
     uint64_t total = ds4_engine_dynamic_expert_cache_bytes(e);
     total = ds4_add_sat_u64(total, e->ssd_streaming_prefill_headroom_bytes);
-    total = ds4_add_sat_u64(total, e->v41_prefill_layer_copy_bytes);
+    total = ds4_add_sat_u64(total, e->v41_copy_window_slots ? 0 : e->v41_prefill_layer_copy_bytes);
     total = ds4_add_sat_u64(total,
                             e->ssd_streaming_decode_map_extra_bytes);
     return total;
@@ -44885,7 +44897,7 @@ static void ds4_engine_print_startup_memory(
     total = ds4_add_sat_u64(total, resident_model_bytes);
     total = ds4_add_sat_u64(total, dynamic_expert_cache_bytes);
     total = ds4_add_sat_u64(total, expert_reserved_bytes);
-    total = ds4_add_sat_u64(total, e->v41_prefill_layer_copy_bytes);
+    total = ds4_add_sat_u64(total, e->v41_copy_window_slots ? 0 : e->v41_prefill_layer_copy_bytes);
     total = ds4_add_sat_u64(total, e->tp.dspark_split_bytes);
 
     const bool color = ds4_log_is_tty(stderr);
@@ -44912,9 +44924,15 @@ static void ds4_engine_print_startup_memory(
                 " + prefill expert reserve %.2f GiB",
                 ds4_bytes_to_gib(expert_reserved_bytes));
     }
-    if (e->v41_prefill_layer_copy_bytes != 0) {
+    if (e->v41_prefill_layer_copy_bytes != 0 && !e->v41_copy_window_slots) {
         fprintf(stderr, " + prefill layer copy %.2f GiB",
                 ds4_bytes_to_gib(e->v41_prefill_layer_copy_bytes));
+    }
+    if (e->v41_copy_window_slots) {
+        fprintf(stderr, " (shared prefill windows %.2f GiB; prefill=%u decode=%u experts)",
+            ds4_bytes_to_gib(2u * e->v41_copy_window_slots * e->v41_copy_window_stride),
+            e->ssd_streaming_cache_experts - 2u * e->v41_copy_window_slots,
+            e->ssd_streaming_cache_experts);
     }
     if (e->tp.dspark_split_bytes != 0) {
         fprintf(stderr,
@@ -67648,6 +67666,11 @@ static bool ds4_engine_configure_streaming_cache_budget(ds4_engine *e) {
             budget = 0;
             budget_expert_bytes = 0;
         }
+        if (e->v41_copy_window_slots) {
+            budget_expert_bytes = e->v41_copy_window_stride;
+            const uint64_t physical_count = budget_after_prefill_headroom / budget_expert_bytes;
+            if (budget > physical_count) budget = (uint32_t)physical_count;
+        }
         e->ssd_streaming_cache_experts = budget;
         e->ssd_streaming_cache_bytes =
             (uint64_t)budget * budget_expert_bytes;
@@ -67885,6 +67908,7 @@ static void ds4_engine_fit_glm_streaming_budget(
     if (prefill_headroom > option_bytes) prefill_headroom = option_bytes;
     option_bytes -= prefill_headroom;
 
+    if (e->v41_copy_window_slots) per_expert_bytes = e->v41_copy_window_stride;
     uint32_t cache_experts = old_cache_experts;
     uint64_t dynamic_bytes = ds4_engine_dynamic_expert_cache_bytes(e);
     if (has_routed_experts && dynamic_bytes > option_bytes) {
@@ -69738,13 +69762,14 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     const uint64_t base_weights = weights;
     weights = ds4_add_sat_u64(weights, support_bytes);
     const uint64_t prefill_bytes = ds4_add_sat_u64(
-        e->ssd_streaming_prefill_headroom_bytes, e->v41_prefill_layer_copy_bytes);
+        e->ssd_streaming_prefill_headroom_bytes, e->v41_copy_window_slots ? 0 : e->v41_prefill_layer_copy_bytes);
     const uint64_t fixed = ds4_add_sat_u64(weights,
         ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(2u * gib, prefill_bytes)));
     const uint64_t fixed_without_support = ds4_add_sat_u64(base_weights,
         ds4_add_sat_u64(graph_bytes, ds4_add_sat_u64(2u * gib, prefill_bytes)));
     uint64_t expert = 0;
     if (e->ssd_streaming && !ds4_streaming_routed_expert_bytes(&e->weights, &expert)) return false;
+    if (e->v41_copy_window_slots) expert = e->v41_copy_window_stride;
     if (fixed >= budget || (expert && budget - fixed < expert)) {
         if (support_bytes && fixed_without_support < budget &&
             support_bytes >= budget - fixed_without_support) {
@@ -69769,6 +69794,13 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
                 e->ssd_streaming_cache_experts, count);
         e->ssd_streaming_cache_experts = count;
         e->ssd_streaming_cache_bytes = (uint64_t)count * expert;
+    }
+    if (e->v41_copy_window_slots) {
+        if (e->ssd_streaming_cache_experts <= 2u * e->v41_copy_window_slots) {
+            fprintf(stderr, "ds4: V4.1 cache budget cannot hold both prefill windows and cache slots\n");
+            return false;
+        }
+        e->ssd_streaming_cache_bytes = (uint64_t)e->ssd_streaming_cache_experts * expert;
     }
     return true;
 }
@@ -70155,6 +70187,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 return 1;
             }
             e->v41_prefill_layer_copy_bytes = 2u * max_bytes;
+            if (metal_graph_v41_copy_cache_window_enabled()) {
+                uint64_t expert = 0;
+                if (!ds4_streaming_routed_expert_bytes(&e->weights, &expert) ||
+                    !ds4_window_layout(max_bytes, expert, (uint64_t)getpagesize(),
+                        &e->v41_copy_window_stride, &e->v41_copy_window_slots)) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+            }
         }
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
@@ -70675,7 +70717,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #if defined(__APPLE__)
         /* Admit and allocate before any cache slabs or session graphs grow. The
          * sweep's allocation call remains a no-op reuse/standalone fallback. */
-        if (e->v41_prefill_layer_copy_bytes &&
+        if (e->v41_prefill_layer_copy_bytes && !e->v41_copy_window_slots &&
             !ds4_gpu_v41_prefill_layer_copy_allocate(e->v41_prefill_layer_copy_bytes / 2u)) {
             fprintf(stderr, "ds4: V4.1 startup prefill layer copy allocation failed\n");
             ds4_engine_close(e);
@@ -70684,6 +70726,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
         }
 #endif
         ds4_gpu_set_streaming_expert_cache_budget(e->ssd_streaming_cache_experts);
+#if defined(__APPLE__)
+        if (e->v41_copy_window_slots &&
+            !ds4_gpu_v41_window_initialize(e->v41_prefill_layer_copy_bytes / 2u,
+                e->v41_copy_window_stride, e->v41_copy_window_slots)) {
+            fprintf(stderr, "ds4: V4.1 copy cache window initialization failed\n");
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+#endif
 #if defined(__APPLE__)
         /* Keep the weights used by every token from competing with streamed
          * experts in the file cache. These bytes are already in the model
@@ -70698,7 +70750,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                     ds4_engine_dynamic_expert_cache_bytes(e),
                     ds4_add_sat_u64(e->ssd_streaming_prefill_headroom_bytes,
                         ds4_add_sat_u64(e->ssd_streaming_full_layer_bytes,
-                                       e->v41_prefill_layer_copy_bytes)));
+                                       e->v41_copy_window_slots ? 0 : e->v41_prefill_layer_copy_bytes)));
             const bool fits =
                 weights_streaming_non_routed_bytes(&e->weights, &static_bytes) &&
                 static_bytes <= budget && experts <= budget - static_bytes;

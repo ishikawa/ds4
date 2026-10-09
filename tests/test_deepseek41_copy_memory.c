@@ -75,6 +75,45 @@ static int check_resident_copy_memory(void) {
     const uint32_t fitted = e.ssd_streaming_cache_experts;
     REQUIRE(!ds41_memory_admit_for_host(&e, graph + expert, false, 128u * gib, 110u * gib));
     REQUIRE(e.ssd_streaming_cache_experts == fitted);
+    /* Shared storage is charged once at physical slot stride, guard intact. */
+    REQUIRE(ds4_window_layout(max_bytes, expert, 16384,
+        &e.v41_copy_window_stride, &e.v41_copy_window_slots));
+    e.ssd_streaming_cache_experts = 40u * 384u;
+    REQUIRE(ds41_memory_admit_for_host(&e, graph, true, 128u * gib, 110u * gib));
+    REQUIRE(e.ssd_streaming_cache_bytes ==
+        (uint64_t)e.ssd_streaming_cache_experts * e.v41_copy_window_stride);
+    REQUIRE(fixed.bytes + graph + 2u * gib + e.ssd_streaming_cache_bytes <= 56u * gib);
+    REQUIRE(fixed.bytes + graph + 2u * gib + e.ssd_streaming_cache_bytes +
+        e.v41_copy_window_stride > 56u * gib);
+    REQUIRE(e.ssd_streaming_cache_experts > fitted);
+    REQUIRE(e.ssd_streaming_cache_experts > 2u * e.v41_copy_window_slots);
+    REQUIRE(!ds41_memory_admit_for_host(&e, graph + e.v41_copy_window_stride,
+        false, 128u * gib, 110u * gib));
+    e.ssd_streaming_cache_experts = 2u * e.v41_copy_window_slots;
+    REQUIRE(!ds41_memory_admit_for_host(&e, graph, true, 128u * gib, 110u * gib));
+    /* Computed examples anchored to reported rounded 32768 plan components.
+     * This fixture has no GGUF metadata; exact file bytes may shift a slot. */
+    const uint64_t reported_copy = (uint64_t)(9.924 * (double)gib);
+    fixed.bytes = 54u * gib - graph - 2893u * expert - reported_copy;
+    e.v41_prefill_layer_copy_bytes = reported_copy;
+    REQUIRE(ds4_window_layout(reported_copy / 2u, expert, 16384,
+        &e.v41_copy_window_stride, &e.v41_copy_window_slots));
+    const uint32_t contexts[] = {32768, 131072};
+    for (uint32_t i = 0; i < 2; i++) {
+        const uint64_t runtime = ds41_graph_bytes(contexts[i]);
+        e.ssd_streaming_cache_bytes = 42u * gib;
+        REQUIRE(ds4_engine_configure_streaming_cache_budget(&e));
+        REQUIRE(ds41_memory_admit_for_host(&e, runtime, true, 128u * gib, 110u * gib));
+        fprintf(stderr, "computed fixture ctx=%u graph=%.6f static=%.6f cache=%.6f planned=%.6f prefill=%u decode=%u window_slots=%u\n",
+            contexts[i], ds4_bytes_to_gib(runtime), ds4_bytes_to_gib(fixed.bytes),
+            ds4_bytes_to_gib(e.ssd_streaming_cache_bytes),
+            ds4_bytes_to_gib(fixed.bytes + runtime + e.ssd_streaming_cache_bytes),
+            e.ssd_streaming_cache_experts - 2u * e.v41_copy_window_slots,
+            e.ssd_streaming_cache_experts, e.v41_copy_window_slots);
+        e.ssd_streaming_static_decode_map = true;
+        e.ssd_streaming_decode_map_bytes = fixed.bytes;
+        ds4_engine_print_startup_memory(&e, (int)contexts[i]);
+    }
     puts("V4.1 resident copy packing, reserve replacement and memory admission: PASS");
     rc = 0;
 done:

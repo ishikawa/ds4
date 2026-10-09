@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "ds4_qwen4_vision.h"
 #include "ds4_gpu_copy.h"
+#include "ds4_cache_window.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -286,6 +287,9 @@ static inline bool ds4_gpu_v41_prefill_layer_copy_span(
 #if defined(__APPLE__)
 /* V4.1 streaming prefill only; packed spans retain their GGUF offset identity. */
 int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes);
+int ds4_gpu_v41_window_initialize(uint64_t packed, uint64_t stride, uint32_t slots);
+int ds4_gpu_v41_window_reserve(void);
+int ds4_gpu_v41_window_return(void);
 void *ds4_gpu_v41_prefill_layer_copy_contents(uint32_t slot);
 int ds4_gpu_v41_prefill_layer_copy_bind(const void *map, uint64_t model_size,
         uint32_t slot, const uint64_t *offsets, const uint64_t *sizes, uint32_t count);
