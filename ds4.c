@@ -64030,7 +64030,8 @@ int ds4_dump_chat_tokenization(const char *model_path,
 
 #ifndef DS4_NO_GPU
 #ifdef __APPLE__
-static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache);
+static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache,
+                                bool cache_configured);
 #endif
 static bool imatrix_read_text_file(const char *path, char **out, size_t *len_out) {
     *out = NULL;
@@ -64107,7 +64108,7 @@ static int ds4_engine_collect_sequential_imatrix(
         }
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+                ds41_graph_bytes((uint32_t)ctx_size)), false, true) ||
             !ds41_graph_alloc(&d, &e->model, &e->weights, e->model_path,
                               (uint32_t)ctx_size, e->ssd_streaming,
                               e->allow_external_engram_outside)) return 1;
@@ -69741,7 +69742,7 @@ static bool engine_warm_full_model(const ds4_engine_options *opt) {
 
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
-                                      bool fit_cache, uint64_t host,
+                                      bool fit_cache, bool cache_configured, uint64_t host,
                                       uint64_t recommended) {
     const uint64_t gib = UINT64_C(1073741824);
     if (!host || !recommended) {
@@ -69795,7 +69796,8 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
         e->ssd_streaming_cache_experts = count;
         e->ssd_streaming_cache_bytes = (uint64_t)count * expert;
     }
-    if (e->v41_copy_window_slots) {
+    /* Startup also admits fixed memory before the cache target is configured. */
+    if (e->v41_copy_window_slots && cache_configured) {
         if (e->ssd_streaming_cache_experts <= 2u * e->v41_copy_window_slots) {
             fprintf(stderr, "ds4: V4.1 cache budget cannot hold both prefill windows and cache slots\n");
             return false;
@@ -69805,8 +69807,9 @@ static bool ds41_memory_admit_for_host(ds4_engine *e, uint64_t graph_bytes,
     return true;
 }
 
-static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache) {
-    return ds41_memory_admit_for_host(e, graph_bytes, fit_cache,
+static bool ds41_memory_admit(ds4_engine *e, uint64_t graph_bytes, bool fit_cache,
+                                bool cache_configured) {
+    return ds41_memory_admit_for_host(e, graph_bytes, fit_cache, cache_configured,
         glm_graph_host_memory_bytes(), ds4_gpu_recommended_working_set_size());
 }
 #endif
@@ -70201,7 +70204,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
-        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+        if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true, false)) {
             ds4_engine_close(e);
             *out = NULL;
             return 1;
@@ -70685,7 +70688,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
             const uint32_t sessions = e->placement_session_count_hint > 0 ?
                 (uint32_t)e->placement_session_count_hint : 1;
-            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true)) {
+            if (!ds41_memory_admit(e, ds4_mul_sat_u64(ds41_graph_bytes(ctx), sessions), true, true)) {
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
@@ -72281,7 +72284,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
         if (ctx_size > 1048576 ||
             !ds41_memory_admit(e, ds4_add_sat_u64(e->ds41_session_bytes,
-                ds41_graph_bytes((uint32_t)ctx_size)), false) ||
+                ds41_graph_bytes((uint32_t)ctx_size)), false, true) ||
             !ds41_graph_alloc(&s->ds41_graph, &e->model, &e->weights,
                               e->model_path, (uint32_t)ctx_size, e->ssd_streaming,
                               e->allow_external_engram_outside)) {
