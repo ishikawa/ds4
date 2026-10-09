@@ -266,6 +266,13 @@ int ds4_gpu_side_dense_q8_ok(void);
 
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
+#if defined(__APPLE__)
+/* V4.1 streaming prefill only; packed spans retain their GGUF offset identity. */
+int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes);
+void *ds4_gpu_v41_prefill_layer_copy_contents(uint32_t slot);
+int ds4_gpu_v41_prefill_layer_copy_bind(const void *map, uint64_t model_size,
+        uint32_t slot, const uint64_t *offsets, const uint64_t *sizes, uint32_t count);
+#endif
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /* Add a secondary GGUF mapping without replacing the primary model mapping. */
 int ds4_gpu_set_aux_model_map_range(const void *model_map,

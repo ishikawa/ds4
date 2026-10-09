@@ -19112,7 +19112,11 @@ static void metal_graph_stream_readahead_spans(
 typedef struct {
     uint64_t off;
     uint64_t size;
+    uint8_t *destination;
 } metal_graph_stream_pagein_range;
+
+/* Scoped to the V4.1 layer-major sweep; other prepare callers stay unchanged. */
+static bool metal_graph_v41_resident_copy;
 
 typedef struct {
     pthread_t thread;
@@ -19883,7 +19887,8 @@ static bool metal_graph_stream_pread_range(
         uint64_t         offset,
         uint64_t         size,
         uint64_t        *read_bytes,
-        uint8_t         *sink) {
+        uint8_t         *sink,
+        uint8_t         *destination) {
     if (!model ||
         model->fd < 0 ||
         offset > model->size ||
@@ -19894,7 +19899,8 @@ static bool metal_graph_stream_pread_range(
     if (offset > (uint64_t)LLONG_MAX) return false;
 
     const size_t chunk = 1024u * 1024u;
-    uint8_t *buf = xmalloc(chunk);
+    uint8_t *scratch = destination ? NULL : xmalloc(chunk);
+    uint8_t *buf = destination ? destination : scratch;
     uint64_t pos = offset;
     uint64_t rem = size;
     uint8_t s = sink ? *sink : 0;
@@ -19913,13 +19919,14 @@ static bool metal_graph_stream_pread_range(
         s ^= buf[(size_t)nread - 1u];
         pos += (uint64_t)nread;
         rem -= (uint64_t)nread;
+        if (destination) buf += (size_t)nread;
         if (read_bytes) {
             *read_bytes = *read_bytes > UINT64_MAX - (uint64_t)nread ?
                 UINT64_MAX : *read_bytes + (uint64_t)nread;
         }
     }
     if (sink) *sink = s;
-    free(buf);
+    free(scratch);
     return ok;
 }
 
@@ -19928,14 +19935,16 @@ static bool metal_graph_stream_prepare_range(
         uint64_t                             offset,
         uint64_t                             size,
         uint64_t                            *touched,
-        uint8_t                             *sink) {
+        uint8_t                             *sink,
+        uint8_t                             *destination) {
     if (!job) return false;
     if (job->pread_only) {
         return metal_graph_stream_pread_range(job->model,
                                               offset,
                                               size,
                                               touched,
-                                              sink);
+                                              sink,
+                                              destination);
     }
     if (job->readahead_only) {
         metal_graph_stream_readahead_range_impl(job->model,
@@ -19971,7 +19980,8 @@ static void *metal_graph_stream_pagein_thread_main(void *arg) {
                                                          job->ranges[i].off,
                                                          job->ranges[i].size,
                                                          &job->touched,
-                                                         &job->sink);
+                                                         &job->sink,
+                                                         job->ranges[i].destination);
         if (!ok) {
             job->ok = false;
             break;
@@ -19997,7 +20007,8 @@ static void *metal_graph_stream_pagein_worker_main(void *arg) {
                                                          job->ranges[i].off,
                                                          job->ranges[i].size,
                                                          &worker->touched,
-                                                         &worker->sink);
+                                                         &worker->sink,
+                                                         job->ranges[i].destination);
         if (!ok) {
             worker->ok = false;
             break;
@@ -20193,14 +20204,17 @@ static bool metal_graph_stream_prefill_selected_pagein_start(
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 layer->ffn_gate_exps->abs_offset + gate_rel,
                 gate_bytes,
+                NULL,
             };
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 layer->ffn_up_exps->abs_offset + gate_rel,
                 gate_bytes,
+                NULL,
             };
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 layer->ffn_down_exps->abs_offset + down_rel,
                 down_bytes,
+                NULL,
             };
             uint64_t run_bytes = UINT64_MAX;
             if (gate_bytes <= (UINT64_MAX - down_bytes) / 2ull) {
@@ -20357,7 +20371,7 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     job->layer = il;
     job->n_tokens = n_tokens;
 
-    if (pread_only) {
+    if (pread_only && !metal_graph_v41_resident_copy) {
         if (g) {
             if (!metal_graph_stream_prefill_layer_pread_enabled(g)) return true;
         } else if (glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_LAYER_PREAD",
@@ -20386,7 +20400,7 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
                                          "DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_MADVISE")) {
             return true;
         }
-    } else {
+    } else if (!pread_only) {
         if (g) {
             if (!metal_graph_stream_prefill_layer_pagein_enabled(g)) return true;
         } else if (!glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN",
@@ -20408,6 +20422,11 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
     metal_graph_stream_pagein_range *ranges =
         xmalloc((size_t)spans.len * n_threads * sizeof(ranges[0]));
     uint32_t n_ranges = 0;
+    uint8_t *destination = NULL;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (metal_graph_v41_resident_copy)
+        destination = ds4_gpu_v41_prefill_layer_copy_contents(il % 2u);
+#endif
     const uint64_t page = (uint64_t)getpagesize();
     for (uint32_t i = 0; i < spans.len; i++) {
         const uint64_t size = spans.v[i].end - spans.v[i].off;
@@ -20422,6 +20441,7 @@ static bool metal_graph_stream_prefill_layer_pagein_start(
             ranges[n_ranges++] = (metal_graph_stream_pagein_range){
                 spans.v[i].off + consumed,
                 this_size,
+                destination ? destination + job->bytes + consumed : NULL,
             };
             consumed += this_size;
         }
@@ -20918,7 +20938,22 @@ static bool metal_graph_stream_map_layer(
         fprintf(stderr, "ds4: Metal SSD streaming could not build layer %u spans\n", il);
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "layer");
+    bool ok;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (metal_graph_v41_resident_copy) {
+        uint64_t *offsets = xmalloc(spans.len * sizeof(*offsets));
+        uint64_t *sizes = xmalloc(spans.len * sizeof(*sizes));
+        for (uint32_t i = 0; i < spans.len; i++) {
+            offsets[i] = spans.v[i].off;
+            sizes[i] = spans.v[i].end - spans.v[i].off;
+        }
+        ok = ds4_gpu_v41_prefill_layer_copy_bind(model->map, model->size,
+                il % 2u, offsets, sizes, spans.len) != 0;
+        free(offsets);
+        free(sizes);
+    } else
+#endif
+        ok = metal_graph_install_model_spans(model, &spans, "layer");
     free(spans.v);
     return ok;
 }
@@ -43359,6 +43394,29 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     bool engram_prefetched = overlap_engram &&
         ds41_engram_prefetch_start(&engram_prefetch, g, 0, total_count);
     bool ok = !g->streaming || metal_graph_stream_map_token(m, w);
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    const char *copy_env = getenv("DS4_METAL_V41_PREFILL_RESIDENT_LAYER_COPY");
+    metal_graph_v41_resident_copy = g->streaming && copy_env && !strcmp(copy_env, "1");
+    if (ok && metal_graph_v41_resident_copy) {
+        uint64_t max_bytes = 0;
+        for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+            ds4_model_map_span_vec spans;
+            ok = weights_model_map_spans(w, il, il, false, &spans);
+            if (!ok) break;
+            uint64_t bytes = 0;
+            for (uint32_t i = 0; i < spans.len; i++) {
+                const uint64_t size = spans.v[i].end - spans.v[i].off;
+                if (size > UINT64_MAX - bytes) { ok = false; break; }
+                bytes += size;
+            }
+            if (bytes > max_bytes) max_bytes = bytes;
+            free(spans.v);
+        }
+        /* Also protects the first prepare from a preceding request's work. */
+        if (ok) ok = ds4_gpu_synchronize() &&
+                     ds4_gpu_v41_prefill_layer_copy_allocate(max_bytes);
+    }
+#endif
     metal_graph_stream_prepare_slot prepare = {0};
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) { ok = false; break; }
@@ -43377,12 +43435,14 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
         const double t0 = profile ? now_sec() : 0;
         const uint32_t first_count = total_count < encoder_chunk ? total_count : encoder_chunk;
         if (g->streaming) {
-            if (!g->encoder_resident || il >= 20)
+            if (metal_graph_v41_resident_copy || !g->encoder_resident || il >= 20)
                 ok = metal_graph_stream_prepare_join_layer(NULL, m, w, il, first_count,
                         false, true, false, false, &prepare, 1);
             if (ok) ok = metal_graph_stream_map_layer(m, w, il);
             if (ok && il + 1u < (encoder_only ? 20u : DS4_N_LAYER) &&
-                (!g->encoder_resident || il + 1u >= 20))
+                (metal_graph_v41_resident_copy || !g->encoder_resident || il + 1u >= 20))
+                /* il-1 compute and seed both ended synchronously below before
+                 * we reuse its slot for il+1; il uses the other slot. */
                 ok = metal_graph_stream_prepare_start_if_needed(NULL, m, w, il + 1u, first_count,
                         false, true, false, false, &prepare, 1);
         }
@@ -43636,6 +43696,10 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
     }
     if (!ds41_engram_prefetch_join(&engram_prefetch, !ok)) ok = false;
     if (!metal_graph_stream_prepare_join_all(&prepare, 1)) ok = false;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (metal_graph_v41_resident_copy && !ds4_gpu_synchronize()) ok = false;
+#endif
+    metal_graph_v41_resident_copy = false;
     if (g->streaming && !metal_graph_stream_map_decode_static_all(m, w)) ok = false;
     if (ok && !encoder_only) {
         ok = ds4_gpu_begin_commands() &&

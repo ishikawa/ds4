@@ -1014,10 +1014,14 @@ typedef struct {
     uint64_t model_size;
     uint64_t model_offset;
     uint64_t bytes;
+    uint64_t buffer_offset;
 } ds4_gpu_model_view;
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
+static id<MTLBuffer> g_v41_prefill_layer_copy[2];
+static uint64_t g_v41_prefill_layer_copy_bytes;
+static const void *g_v41_prefill_layer_copy_map;
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -2593,6 +2597,7 @@ static void ds4_gpu_progress_failed(void) {
 }
 
 static void ds4_gpu_model_views_clear(void) {
+    g_v41_prefill_layer_copy_map = NULL;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
         g_model_views[i].model_map = NULL;
@@ -2604,6 +2609,7 @@ static void ds4_gpu_model_views_clear(void) {
 }
 
 static void ds4_gpu_model_views_remove_map(const void *model_map) {
+    if (g_v41_prefill_layer_copy_map == model_map) g_v41_prefill_layer_copy_map = NULL;
     uint32_t kept = 0;
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         if (g_model_views[i].model_map != model_map)
@@ -2675,6 +2681,10 @@ static int ds4_gpu_model_residency_request_views(void) {
 
         for (uint32_t i = 0; i < g_model_view_count; i++) {
             [g_model_residency_set addAllocation:g_model_views[i].buffer];
+        }
+        for (uint32_t i = 0; i < 2; i++) {
+            if (g_v41_prefill_layer_copy[i])
+                [g_model_residency_set addAllocation:g_v41_prefill_layer_copy[i]];
         }
         [g_model_residency_set commit];
         [g_model_residency_set requestResidency];
@@ -2822,6 +2832,7 @@ static int ds4_gpu_add_model_view_range(
         g_model_views[g_model_view_count].model_size = model_size;
         g_model_views[g_model_view_count].model_offset = page_model_offset + off;
         g_model_views[g_model_view_count].bytes = view_bytes;
+        g_model_views[g_model_view_count].buffer_offset = 0;
         g_model_view_count++;
 
         g_model_wrap_count++;
@@ -12717,6 +12728,9 @@ void ds4_gpu_cleanup(void) {
         g_model_buffer_cache_over_limit = 0;
         ds4_gpu_model_residency_clear();
         ds4_gpu_model_views_clear();
+        g_v41_prefill_layer_copy[0] = nil;
+        g_v41_prefill_layer_copy[1] = nil;
+        g_v41_prefill_layer_copy_bytes = 0;
         [g_pipeline_cache removeAllObjects];
         g_pipeline_cache = nil;
         [g_q4_expert_layer_residency_cache removeAllObjects];
@@ -13621,6 +13635,81 @@ int ds4_gpu_set_model_map_spans(
     }
 }
 
+int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!bytes || bytes > (uint64_t)[g_device maxBufferLength]) return 0;
+    if (g_v41_prefill_layer_copy_bytes >= bytes) return 1;
+    @autoreleasepool {
+        id<MTLBuffer> buffers[2];
+        for (uint32_t i = 0; i < 2; i++) {
+            buffers[i] = [g_device newBufferWithLength:(NSUInteger)bytes
+                                             options:MTLResourceStorageModeShared];
+            if (!buffers[i]) return 0;
+            buffers[i].label = @"ds4_v41_prefill_layer_copy";
+        }
+        /* Touch every page on the GPU once, including when model residency is
+         * disabled for SSD streaming. This happens before the first prepare. */
+        id<MTLCommandBuffer> cb = ds4_gpu_new_command_buffer();
+        if (!cb) return 0;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return 0;
+        for (uint32_t i = 0; i < 2; i++)
+            [blit fillBuffer:buffers[i] range:NSMakeRange(0, (NSUInteger)bytes) value:0];
+        [blit endEncoding];
+        if (!ds4_gpu_finish_command_buffer(cb, 1, "V4.1 resident layer warmup")) return 0;
+#if TARGET_OS_OSX
+        if (@available(macOS 15.0, *)) {
+            if (g_model_residency_set) {
+                for (uint32_t i = 0; i < 2; i++) {
+                    if (g_v41_prefill_layer_copy[i])
+                        [g_model_residency_set removeAllocation:g_v41_prefill_layer_copy[i]];
+                    [g_model_residency_set addAllocation:buffers[i]];
+                }
+                [g_model_residency_set commit];
+                [g_model_residency_set requestResidency];
+            }
+        }
+#endif
+        for (uint32_t i = 0; i < 2; i++) g_v41_prefill_layer_copy[i] = buffers[i];
+        g_v41_prefill_layer_copy_bytes = bytes;
+        fprintf(stderr, "ds4: V4.1 resident prefill layer copy buffers=2 size_each=%.3f GiB extra=%.3f GiB\n",
+                ds4_gpu_gib(bytes), 2.0 * ds4_gpu_gib(bytes));
+        return 1;
+    }
+}
+
+void *ds4_gpu_v41_prefill_layer_copy_contents(uint32_t slot) {
+    return slot < 2 ? [g_v41_prefill_layer_copy[slot] contents] : NULL;
+}
+
+int ds4_gpu_v41_prefill_layer_copy_bind(const void *map, uint64_t model_size,
+        uint32_t slot, const uint64_t *offsets, const uint64_t *sizes, uint32_t count) {
+    if (slot >= 2 || !g_v41_prefill_layer_copy[slot] || !map || !offsets || !sizes || !count)
+        return 0;
+    uint64_t packed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || !sizes[i] || sizes[i] > model_size - offsets[i] ||
+            sizes[i] > g_v41_prefill_layer_copy_bytes - packed) return 0;
+        packed += sizes[i];
+    }
+    ds4_gpu_model_views_remove_map(map);
+    if (count > DS4_METAL_MAX_MODEL_VIEWS - g_model_view_count) return 0;
+    packed = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        g_model_views[g_model_view_count++] = (ds4_gpu_model_view){
+            g_v41_prefill_layer_copy[slot], map, model_size, offsets[i], sizes[i], packed
+        };
+        packed += sizes[i];
+    }
+    g_v41_prefill_layer_copy_map = map;
+    g_model_map_ptr = map;
+    g_model_map_size = model_size;
+    g_model_mapped_offset = offsets[0];
+    g_model_mapped_size = packed;
+    g_model_mapped_max_tensor_bytes = 0;
+    return 1;
+}
+
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     return ds4_gpu_set_model_map_range(model_map, model_size, 0, model_size, 0);
 }
@@ -13697,7 +13786,7 @@ static id<MTLBuffer> ds4_gpu_wrap_model_range(
         const uint64_t view_start = g_model_views[i].model_offset;
         const uint64_t view_end = view_start + g_model_views[i].bytes;
         if (offset >= view_start && end <= view_end) {
-            *inner_offset = offset - view_start;
+            *inner_offset = g_model_views[i].buffer_offset + offset - view_start;
             return g_model_views[i].buffer;
         }
     }
@@ -13722,6 +13811,22 @@ static id<MTLBuffer> ds4_gpu_wrap_model_exact_range_impl(
         uint64_t    len,
         uint64_t   *inner_offset,
         ds4_gpu_exact_view_lifetime lifetime) {
+    /* Persistent address tables must keep immutable mmap storage: their owned
+     * views outlive this layer. Ordinary exact slices use the copied slot. */
+    if (lifetime != DS4_GPU_EXACT_VIEW_OWNED &&
+        g_v41_prefill_layer_copy_map == model_map) {
+        for (uint32_t i = 0; i < g_model_view_count; i++) {
+            const ds4_gpu_model_view *view = &g_model_views[i];
+            if (view->model_map == model_map && view->model_size == model_size &&
+                (view->buffer == g_v41_prefill_layer_copy[0] ||
+                 view->buffer == g_v41_prefill_layer_copy[1]) &&
+                offset >= view->model_offset && offset - view->model_offset <= view->bytes &&
+                len <= view->bytes - (offset - view->model_offset)) {
+                if (inner_offset) *inner_offset = view->buffer_offset + offset - view->model_offset;
+                return view->buffer;
+            }
+        }
+    }
     const bool cache_view = lifetime == DS4_GPU_EXACT_VIEW_CACHED;
     const bool transient_view = lifetime == DS4_GPU_EXACT_VIEW_TRANSIENT;
     if (!model_map || !g_device ||
