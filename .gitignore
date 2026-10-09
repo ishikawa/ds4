@@ -102,6 +102,7 @@
 /tests/test_qwen4_ngrams
 /tests/test_qwen4_ngram_state
 /tests/test_deepseek41_graph
+/tests/test_deepseek41_copy_memory
 /tests/test_deepseek41_prefill
 /tests/test_deepseek41_cli
 /tests/test_engram_ggml

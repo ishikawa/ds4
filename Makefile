@@ -239,6 +239,16 @@ tests/test_deepseek41_metal: tests/test_deepseek41_metal.o $(CORE_OBJS)
 test-deepseek41-metal: tests/test_deepseek41_metal
 	./tests/test_deepseek41_metal
 
+tests/test_deepseek41_copy_memory.o: tests/test_deepseek41_copy_memory.c ds4.c ds4_gpu.h ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
+
+tests/test_deepseek41_copy_memory: tests/test_deepseek41_copy_memory.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-deepseek41-copy-memory
+test-deepseek41-copy-memory: tests/test_deepseek41_copy_memory
+	./tests/test_deepseek41_copy_memory
+
 tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -1394,7 +1404,7 @@ clean:
 	rm -f tests/test_cuda_grouped_q8
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
-	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli tests/test_deepseek41_copy_memory
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch
