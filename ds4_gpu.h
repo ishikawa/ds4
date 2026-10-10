@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "ds4_qwen4_vision.h"
 #include "ds4_gpu_copy.h"
+#include "ds4_cache_window.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -266,6 +267,33 @@ int ds4_gpu_side_dense_q8_ok(void);
 
 int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
+/* Preserve each GGUF span's page-relative alignment in a copied layer.
+ * Use this rule for allocation sizing, CPU reads, and Metal view offsets. */
+static inline bool ds4_gpu_v41_prefill_layer_copy_span(
+        uint64_t previous_end, uint64_t file_offset, uint64_t size,
+        uint64_t *packed_offset, uint64_t *packed_end) {
+    const uint64_t mask = 4095u;
+    if (previous_end > UINT64_MAX - mask) return false;
+    const uint64_t page = (previous_end + mask) & ~mask;
+    const uint64_t leading = file_offset & mask;
+    if (page > UINT64_MAX - leading) return false;
+    const uint64_t offset = page + leading;
+    if (size > UINT64_MAX - offset) return false;
+    *packed_offset = offset;
+    *packed_end = offset + size;
+    return true;
+}
+
+#if defined(__APPLE__)
+/* V4.1 streaming prefill only; packed spans retain their GGUF offset identity. */
+int ds4_gpu_v41_prefill_layer_copy_allocate(uint64_t bytes);
+int ds4_gpu_v41_window_initialize(uint64_t packed, uint64_t stride, uint32_t slots);
+int ds4_gpu_v41_window_reserve(void);
+int ds4_gpu_v41_window_return(void);
+void *ds4_gpu_v41_prefill_layer_copy_contents(uint32_t slot);
+int ds4_gpu_v41_prefill_layer_copy_bind(const void *map, uint64_t model_size,
+        uint32_t slot, const uint64_t *offsets, const uint64_t *sizes, uint32_t count);
+#endif
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 /* Add a secondary GGUF mapping without replacing the primary model mapping. */
 int ds4_gpu_set_aux_model_map_range(const void *model_map,
